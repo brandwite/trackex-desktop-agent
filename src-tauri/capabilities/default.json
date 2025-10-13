@@ -1,0 +1,22 @@
+{
+  "identifier": "default",
+  "description": "Default permissions for TrackEx Agent",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:tray:default",
+    "core:menu:default",
+    "core:window:default",
+    "core:app:default",
+    "core:event:default",
+    "dialog:default",
+    "fs:default",
+    "fs:allow-appdata-read-recursive",
+    "fs:allow-appdata-write-recursive",
+    "http:default",
+    "notification:default",
+    "os:default",
+    "shell:allow-open",
+    "updater:default"
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "productName": "TrackEx Agent",
+  "version": "1.0.0",
+  "identifier": "com.trackex.agent",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TrackEx Agent",
+        "width": 420,
+        "height": 520,
+        "resizable": true,
+        "visible": true,
+        "center": true,
+        "minWidth": 380,
+        "minHeight": 480,
+        "maxWidth": 500,
+        "maxHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "TrackEx Desktop Agent",
+    "longDescription": "Employee monitoring and time tracking agent for TrackEx platform",
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "12.6",
+      "signingIdentity": "Developer ID Application: Leon Svoboda (C4DS6Q994G)"
+    },
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://trackex-nextjs.vercel.app/api/desktop/updates/{{target}}-{{arch}}/{{current_version}}"
+      ],
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5QkE4RDRGMDA0QjNBQzgKUldSV0FBcUQ1NjdGdXdnZ2EvbnFzZDg3ODQ2ZzBLM1FBU2RmVzlscVhCVklSbVJGTHFra3c4WUEKCg=="
+    }
+  }
+}
