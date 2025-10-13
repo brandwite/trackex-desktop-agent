@@ -1,0 +1,79 @@
+name: Build & Release macOS App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*' # runs automatically when you push a version tag like v1.2.3
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build, Sign, Notarize, and Release macOS App
+    runs-on: macos-latest
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_DEVELOPER_CERT_P12: ${{ secrets.APPLE_DEVELOPER_CERT_P12 }}
+      APPLE_DEVELOPER_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      # Import your Apple Developer certificate (.p12)
+      - name: Import Apple Developer certificate
+        run: |
+          echo "${APPLE_DEVELOPER_CERT_P12}" | base64 --decode > certificate.p12
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import certificate.p12 -k build.keychain -P "${APPLE_DEVELOPER_CERT_PASSWORD}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" build.keychain
+          rm -f certificate.p12
+
+      - name: Build Tauri app (macOS)
+        run: |
+          npm run tauri build
+
+      # Notarization step (DMG or .app)
+      - name: Notarize app
+        run: |
+          echo "Searching for .dmg or .app..."
+          FILE_PATH=$(find src-tauri/target/release/bundle/macos -name "*.dmg" -o -name "*.app" | head -n 1)
+          echo "Found file: $FILE_PATH"
+          xcrun notarytool submit "$FILE_PATH" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          echo "Stapling..."
+          xcrun stapler staple "$FILE_PATH"
+
+      # Upload notarized artifact to GitHub Release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/macos/*.dmg
+            src-tauri/target/release/bundle/macos/*.app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
