@@ -37,7 +37,7 @@
     "macOS": {
       "entitlements": "entitlements.plist",
       "minimumSystemVersion": "12.6",
-      "signingIdentity": "Developer ID Application: Leon Svoboda (C4DS6Q994G)"
+      "signingIdentity": null
     },
     "windows": {
       "wix": {
