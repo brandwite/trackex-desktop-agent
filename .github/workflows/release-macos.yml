@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*.*.*' # runs automatically when you push a version tag like v1.2.3
+      - 'v*.*.*'
 
 permissions:
   contents: write
@@ -17,6 +17,7 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_DEVELOPER_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -37,23 +38,38 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
 
-      # Import .p12 certificate directly (not base64)
+      # Import Apple Developer Certificate
       - name: Import Apple Developer Certificate (.p12)
         run: |
           echo "🔐 Importing Apple Developer Certificate..."
+          KEYCHAIN=~/Library/Keychains/build.keychain
           security create-keychain -p "$RUNNER_TEMP" build.keychain
-          security set-keychain-settings -lut 21600 build.keychain
-          security unlock-keychain -p "$RUNNER_TEMP" build.keychain
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN"
+
+          # Import certificate
           security import .github/certs/certificate.p12 \
-            -k ~/Library/Keychains/build.keychain \
+            -k "$KEYCHAIN" \
             -P "${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}" \
             -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
-        shell: bash
 
+          # Allow codesign access
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN"
+
+          # Make the keychain default
+          security list-keychains -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN"
+
+      # Debug: verify codesigning identity
+      - name: List codesigning identities
+        run: security find-identity -v -p codesigning
+
+      # Build and sign the Tauri app
       - name: Build Tauri app (macOS)
         run: npm run tauri build
 
+      # Notarize the app
       - name: Notarize app
         id: notarize
         run: |
@@ -79,13 +95,14 @@ jobs:
           echo "$OUTPUT"
           set -e
 
-          # Extract submission ID if available
+          # Extract submission ID
           SUBMISSION_ID=$(echo "$OUTPUT" | grep -Eo '[A-F0-9-]{36}' | head -n 1)
           echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
 
           if [ $STATUS -ne 0 ]; then
             echo "❌ Notarization failed. Fetching detailed log..."
             if [ -n "$SUBMISSION_ID" ]; then
+              echo "📄 Notarization log:"
               xcrun notarytool log "$SUBMISSION_ID" \
                 --apple-id "$APPLE_ID" \
                 --team-id "$APPLE_TEAM_ID" \
@@ -96,8 +113,7 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Notarization successful!"
-          echo "📎 Stapling..."
+          echo "✅ Notarization successful! Stapling..."
           if [[ "$FILE_PATH" == *.zip ]]; then
             APP_BUNDLE="${FILE_PATH%.zip}.app"
             xcrun stapler staple "$APP_BUNDLE"
@@ -105,6 +121,7 @@ jobs:
             xcrun stapler staple "$FILE_PATH"
           fi
 
+      # Create GitHub release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
