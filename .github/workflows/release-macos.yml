@@ -59,13 +59,28 @@ jobs:
           echo "Searching for .dmg or .app..."
           FILE_PATH=$(find src-tauri/target/release/bundle/macos -name "*.dmg" -o -name "*.app" | head -n 1)
           echo "Found file: $FILE_PATH"
+
+          if [[ "$FILE_PATH" == *.app ]]; then
+            echo "Zipping .app for notarization..."
+            ZIP_PATH="${FILE_PATH%.*}.zip"
+            ditto -c -k --keepParent "$FILE_PATH" "$ZIP_PATH"
+            FILE_PATH="$ZIP_PATH"
+          fi
+
+          echo "Submitting $FILE_PATH for notarization..."
           xcrun notarytool submit "$FILE_PATH" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
+
           echo "Stapling..."
-          xcrun stapler staple "$FILE_PATH"
+          if [[ "$FILE_PATH" == *.zip ]]; then
+            APP_BUNDLE="${FILE_PATH%.zip}.app"
+            xcrun stapler staple "$APP_BUNDLE"
+          else
+            xcrun stapler staple "$FILE_PATH"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
