@@ -1,0 +1,31 @@
+name: Cancel Notarization Submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: "The Notarization submission ID to cancel"
+        required: true
+        type: string
+
+jobs:
+  cancel:
+    runs-on: macos-latest
+
+    steps:
+      - name: Cancel Notarization Submission
+        run: |
+          echo "Cancelling notarization submission: ${{ inputs.submission_id }}"
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+
+          # Apple currently has no official cancel/delete command,
+          # so this will just show status and confirm if it's still pending.
+          # Optional: force submission if stuck in queue for too long.
+          echo "No official 'delete' available — check status manually."
+          
+          echo "If it remains stuck, you can safely ignore it and submit a new build."
+          
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
