@@ -1,0 +1,51 @@
+name: Notarization History & Manage Submissions
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose 'list' to view submissions, or 'show' to view log for a specific submission ID"
+        required: true
+        default: "list"
+        type: choice
+        options:
+          - list
+          - show
+      submission_id:
+        description: "Submission ID (required for 'show')"
+        required: false
+        type: string
+
+jobs:
+  manage-notarization:
+    runs-on: macos-latest
+
+    steps:
+      - name: List All Submissions
+        if: ${{ inputs.action == 'list' }}
+        run: |
+          echo "Fetching notarization submission history from Apple..."
+          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+
+      - name: Show Specific Submission Log
+        if: ${{ inputs.action == 'show' }}
+        run: |
+          if [ -z "${{ inputs.submission_id }}" ]; then
+            echo "❌ You must provide a submission ID when using action 'show'."
+            exit 1
+          fi
+
+          echo "Fetching notarization log for submission: ${{ inputs.submission_id }}"
+          xcrun notarytool log "${{ inputs.submission_id }}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --output-format json > notarization_log.json
+
+          echo "✅ Log saved as notarization_log.json"
+          cat notarization_log.json | jq '.'
+
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
