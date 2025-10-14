@@ -65,9 +65,23 @@ jobs:
       - name: List codesigning identities
         run: security find-identity -v -p codesigning
 
-      # Build and sign the Tauri app
+      # Build the Tauri app
       - name: Build Tauri app (macOS)
         run: npm run tauri build
+
+      # ✅ NEW: Re-sign the app with hardened runtime and secure timestamp
+      - name: Re-sign app with hardened runtime
+        run: |
+          APP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.app"
+          echo "🔏 Re-signing app with hardened runtime and secure timestamp..."
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements src-tauri/entitlements.plist \
+            --sign "Developer ID Application: ${APPLE_TEAM_ID}" \
+            "$APP_PATH"
+
+          echo "✅ Verifying code signature..."
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose "$APP_PATH" || true
 
       # Notarize the app
       - name: Notarize app
@@ -95,7 +109,6 @@ jobs:
           echo "$OUTPUT"
           set -e
 
-          # Extract submission ID
           SUBMISSION_ID=$(echo "$OUTPUT" | grep -Eo '[A-F0-9-]{36}' | head -n 1)
           echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
 
