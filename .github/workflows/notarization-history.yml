@@ -20,12 +20,20 @@ jobs:
   manage-notarization:
     runs-on: macos-latest
 
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
     steps:
       - name: List All Submissions
         if: ${{ inputs.action == 'list' }}
         run: |
           echo "Fetching notarization submission history from Apple..."
-          xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
 
       - name: Show Specific Submission Log
         if: ${{ inputs.action == 'show' }}
@@ -44,8 +52,3 @@ jobs:
 
           echo "✅ Log saved as notarization_log.json"
           cat notarization_log.json | jq '.'
-
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
