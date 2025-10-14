@@ -1,33 +1,26 @@
-name: Notarization History & Manage Submissions
+name: Check and Manage Notarization Submissions
 
 on:
   workflow_dispatch:
     inputs:
-      action:
-        description: "Choose 'list' to view submissions, or 'show' to view log for a specific submission ID"
-        required: true
-        default: "list"
-        type: choice
-        options:
-          - list
-          - show
-      submission_id:
-        description: "Submission ID (required for 'show')"
+      delete_id:
+        description: "Optional submission ID to delete (leave blank to only show history)"
         required: false
-        type: string
+        default: ""
 
 jobs:
   manage-notarization:
     runs-on: macos-latest
 
-    env:
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-
     steps:
-      - name: List All Submissions
-        if: ${{ inputs.action == 'list' }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show notarization submission history
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           echo "Fetching notarization submission history from Apple..."
           xcrun notarytool history \
@@ -35,20 +28,21 @@ jobs:
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID"
 
-      - name: Show Specific Submission Log
-        if: ${{ inputs.action == 'show' }}
+      - name: Delete specific notarization submission (optional)
+        if: ${{ github.event.inputs.delete_id != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DELETE_ID: ${{ github.event.inputs.delete_id }}
         run: |
-          if [ -z "${{ inputs.submission_id }}" ]; then
-            echo "❌ You must provide a submission ID when using action 'show'."
-            exit 1
-          fi
-
-          echo "Fetching notarization log for submission: ${{ inputs.submission_id }}"
-          xcrun notarytool log "${{ inputs.submission_id }}" \
+          echo "Attempting to delete submission ID: $DELETE_ID"
+          xcrun notarytool log "$DELETE_ID" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --output-format json > notarization_log.json
-
-          echo "✅ Log saved as notarization_log.json"
-          cat notarization_log.json | jq '.'
+            --team-id "$APPLE_TEAM_ID"
+          echo "Deleting submission..."
+          xcrun notarytool remove "$DELETE_ID" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
