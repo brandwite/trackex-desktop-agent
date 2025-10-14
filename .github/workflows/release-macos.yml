@@ -40,7 +40,7 @@ jobs:
       # Import .p12 certificate directly (not base64)
       - name: Import Apple Developer Certificate (.p12)
         run: |
-          echo "Importing Apple Developer Certificate..."
+          echo "🔐 Importing Apple Developer Certificate..."
           security create-keychain -p "$RUNNER_TEMP" build.keychain
           security set-keychain-settings -lut 21600 build.keychain
           security unlock-keychain -p "$RUNNER_TEMP" build.keychain
@@ -55,26 +55,49 @@ jobs:
         run: npm run tauri build
 
       - name: Notarize app
+        id: notarize
         run: |
-          echo "Searching for .dmg or .app..."
+          echo "🔍 Searching for .dmg or .app..."
           FILE_PATH=$(find src-tauri/target/release/bundle/macos -name "*.dmg" -o -name "*.app" | head -n 1)
-          echo "Found file: $FILE_PATH"
+          echo "📦 Found file: $FILE_PATH"
 
           if [[ "$FILE_PATH" == *.app ]]; then
-            echo "Zipping .app for notarization..."
+            echo "📦 Zipping .app for notarization..."
             ZIP_PATH="${FILE_PATH%.*}.zip"
             ditto -c -k --keepParent "$FILE_PATH" "$ZIP_PATH"
             FILE_PATH="$ZIP_PATH"
           fi
 
-          echo "Submitting $FILE_PATH for notarization..."
-          xcrun notarytool submit "$FILE_PATH" \
+          echo "🚀 Submitting $FILE_PATH for notarization..."
+          set +e
+          OUTPUT=$(xcrun notarytool submit "$FILE_PATH" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait 2>&1)
+          STATUS=$?
+          echo "$OUTPUT"
+          set -e
 
-          echo "Stapling..."
+          # Extract submission ID if available
+          SUBMISSION_ID=$(echo "$OUTPUT" | grep -Eo '[A-F0-9-]{36}' | head -n 1)
+          echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
+
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ Notarization failed. Fetching detailed log..."
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" || true
+            else
+              echo "⚠️ No submission ID found; skipping log fetch."
+            fi
+            exit 1
+          fi
+
+          echo "✅ Notarization successful!"
+          echo "📎 Stapling..."
           if [[ "$FILE_PATH" == *.zip ]]; then
             APP_BUNDLE="${FILE_PATH%.zip}.app"
             xcrun stapler staple "$APP_BUNDLE"
