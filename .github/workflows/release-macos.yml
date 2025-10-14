@@ -37,17 +37,23 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
 
-      # Import your Apple Developer certificate (.p12) using official action
-      - name: Import Apple Developer certificate
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ secrets.APPLE_DEVELOPER_CERT_P12 }}
-          p12-password: ${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}
+      # Import .p12 certificate directly (not base64)
+      - name: Import Apple Developer Certificate (.p12)
+        run: |
+          echo "Importing Apple Developer Certificate..."
+          security create-keychain -p "$RUNNER_TEMP" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$RUNNER_TEMP" build.keychain
+          security import .github/certs/certificate.p12 \
+            -k ~/Library/Keychains/build.keychain \
+            -P "${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" build.keychain
+        shell: bash
 
       - name: Build Tauri app (macOS)
         run: npm run tauri build
 
-      # Notarization step (DMG or .app)
       - name: Notarize app
         run: |
           echo "Searching for .dmg or .app..."
@@ -61,7 +67,6 @@ jobs:
           echo "Stapling..."
           xcrun stapler staple "$FILE_PATH"
 
-      # Upload notarized artifact to GitHub Release
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
