@@ -63,6 +63,16 @@ jobs:
       - name: Build Tauri app (macOS)
         run: npm run tauri build
 
+      - name: Debug available keychains and identities
+        run: |
+          echo "🔍 Listing keychains..."
+          security list-keychains
+          echo "🔍 Checking identities in each keychain..."
+          for kc in $(security list-keychains | sed 's/[",]//g'); do
+            echo "➡️ Keychain: $kc"
+            security find-identity -v -p codesigning "$kc" || true
+          done
+
       # 🔏 Re-sign with the same Developer ID certificate and hardened runtime
       - name: Re-sign app with hardened runtime
         run: |
@@ -70,7 +80,8 @@ jobs:
           echo "🔏 Re-signing app with hardened runtime..."
           codesign --force --deep --options runtime --timestamp \
             --entitlements src-tauri/entitlements.plist \
-            --sign "Developer ID Application: ${APPLE_TEAM_ID}" \
+            --sign "Developer ID Application: Leon Svoboda (${APPLE_TEAM_ID})" \
+            --keychain build.keychain \
             "$APP_PATH"
 
           echo "✅ Verifying code signature..."
