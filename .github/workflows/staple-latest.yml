@@ -1,0 +1,103 @@
+name: Staple Latest Notarization
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+jobs:
+  staple:
+    name: Staple Latest Notarization to macOS App
+    runs-on: macos-latest
+
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 🔽 Download the latest successful artifact from your release workflow
+      - name: Download latest artifact from previous workflow
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: release-macos.yml
+          branch: main
+          run_id: latest
+          name: notarized-app
+          path: ./downloaded
+
+      - name: Locate downloaded artifact
+        id: find_file
+        run: |
+          echo "🔍 Searching for downloaded .app, .dmg, or .zip..."
+          FILE_PATH=$(find downloaded -name "*.dmg" -o -name "*.zip" -o -name "*.app" | head -n 1)
+          if [ -z "$FILE_PATH" ]; then
+            echo "❌ No valid artifact found in downloaded/"
+            exit 1
+          fi
+          echo "📦 Found file: $FILE_PATH"
+          echo "FILE_PATH=$FILE_PATH" >> $GITHUB_ENV
+
+      - name: Fetch notarization history
+        run: |
+          echo "📡 Fetching notarization history from Apple..."
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" > notarization_history.txt
+
+          echo "✅ Received notarization history."
+          grep -E 'createdDate|id|name|status' notarization_history.txt || cat notarization_history.txt
+
+      - name: Extract latest Accepted notarization ID
+        id: extract
+        run: |
+          SUBMISSION_ID=$(grep -B2 -A2 "status: Accepted" notarization_history.txt | grep "id:" | head -n 1 | awk '{print $2}')
+          if [ -z "$SUBMISSION_ID" ]; then
+            echo "❌ No Accepted notarization found."
+            exit 1
+          fi
+          echo "✅ Latest Accepted Submission ID: $SUBMISSION_ID"
+          echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
+
+      - name: Verify notarization info
+        run: |
+          echo "ℹ️ Fetching info for submission ID: $SUBMISSION_ID"
+          xcrun notarytool info "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD"
+
+      - name: Staple notarization ticket
+        run: |
+          echo "🔖 Stapling notarization ticket to $FILE_PATH..."
+          xcrun stapler staple "$FILE_PATH"
+          echo "✅ Staple complete."
+
+      - name: Validate stapling
+        run: |
+          echo "🧾 Validating stapled app..."
+          xcrun stapler validate "$FILE_PATH"
+          echo "✅ Validation successful!"
+
+      - name: Upload stapled artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: stapled-macos-app
+          path: ${{ env.FILE_PATH }}
+
+      - name: Add artifact link to summary
+        if: always()
+        run: |
+          echo "### ✅ Stapling Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "Your notarized and stapled macOS app is ready to download." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[➡️ Click here to download the artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
