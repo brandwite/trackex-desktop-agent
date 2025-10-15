@@ -8,49 +8,52 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      # Checkout repository (required by actions)
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Download the stapled app artifact (from previous successful run)
+      # ✅ Download the stapled app artifact from the previous workflow
       - name: Download stapled-app artifact
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: staple-latest.yml
+          workflow: staple-latest.yml      # <- the workflow that uploaded stapled-app
           workflow_conclusion: success
           name: stapled-app
           path: ./downloaded
 
-      - name: Inspect downloaded files
-        run: ls -R downloaded
-
-      - name: Unzip stapled app
+      # ✅ Rebuild the .app bundle from the extracted "Contents" folder
+      - name: Prepare stapled app
         run: |
-          unzip "downloaded/stapled-app.zip" -d extracted
-          ls -R extracted
+          echo "📂 Listing downloaded contents..."
+          ls -R downloaded
 
-      # If the ZIP contains only "Contents", restore the proper .app bundle structure
-      - name: Restore .app structure if needed
-        run: |
-          if [ -d "extracted/Contents" ]; then
-            echo "Detected Contents folder only, reconstructing .app bundle..."
-            mkdir "TrackEx Agent.app"
-            mv extracted/Contents "TrackEx Agent.app/"
-          elif [ -d "extracted/TrackEx Agent.app" ]; then
-            echo ".app already exists"
-            mv extracted/TrackEx\ Agent.app .
+          if [ -d "downloaded/Contents" ]; then
+            echo "🧩 Detected unzipped app contents. Rebuilding .app bundle..."
+            mkdir -p "TrackEx Agent.app"
+            mv downloaded/Contents "TrackEx Agent.app/"
+          elif [ -d "downloaded/TrackEx Agent.app" ]; then
+            echo "✅ Detected .app structure already."
+            mv downloaded/TrackEx\ Agent.app .
+          else
+            echo "❌ Could not find expected app structure in artifact."
+            exit 1
           fi
+
+          echo "✅ .app bundle ready:"
           ls -R "TrackEx Agent.app"
 
-      # Create DMG file from the stapled app
-      - name: Create DMG from stapled app
+      # ✅ Create the DMG file from the .app
+      - name: Create DMG
         run: |
-          echo "📦 Creating DMG..."
+          echo "💿 Creating DMG from stapled app..."
           hdiutil create -volname "TrackEx Agent" \
             -srcfolder "TrackEx Agent.app" \
             -ov -format UDZO "TrackEx Agent.dmg"
+          echo "✅ DMG created successfully:"
+          ls -lh "TrackEx Agent.dmg"
 
-      # Upload the generated DMG as an artifact
-      - name: Upload DMG as artifact
+      # ✅ Upload the resulting DMG file as an artifact
+      - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
           name: stapled-dmg
