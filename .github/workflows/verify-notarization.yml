@@ -1,0 +1,50 @@
+name: Verify Apple Notarization
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          echo "APPLE_ID=${{ secrets.APPLE_ID }}" >> $GITHUB_ENV
+          echo "TEAM_ID=${{ secrets.APPLE_TEAM_ID }}" >> $GITHUB_ENV
+          echo "APP_SPECIFIC_PASSWORD=${{ secrets.APP_SPECIFIC_PASSWORD }}" >> $GITHUB_ENV
+
+      - name: Fetch notarization history
+        run: |
+          echo "Fetching notarization history from Apple..."
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" > notarization_history.txt
+          cat notarization_history.txt
+
+      - name: Extract latest submission ID
+        id: extract
+        run: |
+          SUBMISSION_ID=$(grep -m1 "id:" notarization_history.txt | awk '{print $2}')
+          echo "Latest Submission ID: $SUBMISSION_ID"
+          echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
+
+      - name: Get notarization info for latest submission
+        run: |
+          echo "Fetching info for submission ID: $SUBMISSION_ID"
+          xcrun notarytool info "$SUBMISSION_ID" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD"
+
+      - name: Summarize notarization result
+        run: |
+          echo "-------------------------------------------"
+          echo "If status = Accepted ✅, your app is notarized."
+          echo "If status = In Progress ⏳, wait or cancel old ones."
+          echo "If status = Invalid ❌, check your notarization logs."
+          echo "-------------------------------------------"
