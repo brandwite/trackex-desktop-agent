@@ -1,103 +1,107 @@
-name: Staple Latest Notarization
+name: Staple Existing Notarization
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  actions: read
-  id-token: write
+  contents: write
 
 jobs:
   staple:
-    name: Staple Latest Notarization to macOS App
+    name: Rebuild, Re-sign, and Staple Notarized macOS App
     runs-on: macos-latest
-
     env:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_DEVELOPER_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 🔽 Download the latest successful artifact from your release workflow
-      - name: Download latest artifact from previous workflow
-        uses: dawidd6/action-download-artifact@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          workflow: release-macos.yml
-          branch: main
-          run_id: latest
-          name: notarized-app
-          path: ./downloaded
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Locate downloaded artifact
-        id: find_file
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      # 🔐 Import Apple Developer Certificate
+      - name: Import Apple Developer Certificate (.p12)
         run: |
-          echo "🔍 Searching for downloaded .app, .dmg, or .zip..."
-          FILE_PATH=$(find downloaded -name "*.dmg" -o -name "*.zip" -o -name "*.app" | head -n 1)
-          if [ -z "$FILE_PATH" ]; then
-            echo "❌ No valid artifact found in downloaded/"
-            exit 1
-          fi
-          echo "📦 Found file: $FILE_PATH"
-          echo "FILE_PATH=$FILE_PATH" >> $GITHUB_ENV
+          echo "🔐 Importing Apple Developer Certificate..."
+          KEYCHAIN=~/Library/Keychains/build.keychain
+          security create-keychain -p "$RUNNER_TEMP" build.keychain
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN"
 
-      - name: Fetch notarization history
+          security import .github/certs/certificate.p12 \
+            -k "$KEYCHAIN" \
+            -P "${{ secrets.APPLE_DEVELOPER_CERT_PASSWORD }}" \
+            -T /usr/bin/codesign -T /usr/bin/security
+
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN"
+          security list-keychains -s "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN"
+
+      # 🧩 Debug: list available signing identities
+      - name: List codesigning identities
         run: |
-          echo "📡 Fetching notarization history from Apple..."
-          xcrun notarytool history \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APP_SPECIFIC_PASSWORD" > notarization_history.txt
+          echo "🔍 Listing available Developer ID identities..."
+          security find-identity -v -p codesigning
 
-          echo "✅ Received notarization history."
-          grep -E 'createdDate|id|name|status' notarization_history.txt || cat notarization_history.txt
+      # 🏗️ Build the Tauri app (same as notarized build)
+      - name: Build Tauri app (macOS)
+        run: npm run tauri build
 
-      - name: Extract latest Accepted notarization ID
-        id: extract
+      # 🔏 Re-sign with the same Developer ID certificate and hardened runtime
+      - name: Re-sign app with hardened runtime
         run: |
-          SUBMISSION_ID=$(grep -B2 -A2 "status: Accepted" notarization_history.txt | grep "id:" | head -n 1 | awk '{print $2}')
-          if [ -z "$SUBMISSION_ID" ]; then
-            echo "❌ No Accepted notarization found."
-            exit 1
-          fi
-          echo "✅ Latest Accepted Submission ID: $SUBMISSION_ID"
-          echo "SUBMISSION_ID=$SUBMISSION_ID" >> $GITHUB_ENV
+          APP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.app"
+          echo "🔏 Re-signing app with hardened runtime..."
+          codesign --force --deep --options runtime --timestamp \
+            --entitlements src-tauri/entitlements.plist \
+            --sign "Developer ID Application: ${APPLE_TEAM_ID}" \
+            "$APP_PATH"
 
-      - name: Verify notarization info
+          echo "✅ Verifying code signature..."
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose "$APP_PATH" || true
+
+      # 📦 Recreate the same ZIP that was notarized
+      - name: Recreate notarized ZIP
         run: |
-          echo "ℹ️ Fetching info for submission ID: $SUBMISSION_ID"
-          xcrun notarytool info "$SUBMISSION_ID" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APP_SPECIFIC_PASSWORD"
+          APP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.app"
+          ZIP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.zip"
+          echo "📦 Creating ZIP for stapling..."
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+          ls -lh "$ZIP_PATH"
 
+      # 📎 Staple notarization ticket
       - name: Staple notarization ticket
         run: |
-          echo "🔖 Stapling notarization ticket to $FILE_PATH..."
-          xcrun stapler staple "$FILE_PATH"
-          echo "✅ Staple complete."
+          APP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.app"
+          echo "📎 Stapling notarization ticket..."
+          xcrun stapler staple "$APP_PATH" || true
 
-      - name: Validate stapling
-        run: |
-          echo "🧾 Validating stapled app..."
-          xcrun stapler validate "$FILE_PATH"
-          echo "✅ Validation successful!"
+          echo "✅ Validating stapling..."
+          xcrun stapler validate "$APP_PATH" || true
 
-      - name: Upload stapled artifact
-        id: upload
+          echo "🔍 Checking Gatekeeper assessment..."
+          spctl --assess --type execute --verbose "$APP_PATH" || true
+
+      # 📤 (Optional) Upload stapled app as artifact for manual download
+      - name: Upload stapled app
         uses: actions/upload-artifact@v4
         with:
-          name: stapled-macos-app
-          path: ${{ env.FILE_PATH }}
-
-      - name: Add artifact link to summary
-        if: always()
-        run: |
-          echo "### ✅ Stapling Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "Your notarized and stapled macOS app is ready to download." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "[➡️ Click here to download the artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          name: stapled-app
+          path: src-tauri/target/release/bundle/macos/TrackEx Agent.app
