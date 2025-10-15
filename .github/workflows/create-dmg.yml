@@ -1,0 +1,55 @@
+name: Create DMG from Stapled App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-dmg:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Download the stapled app artifact (from previous successful run)
+      - name: Download stapled-app artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: stapled-app
+          path: ./downloaded
+
+      - name: Inspect downloaded files
+        run: ls -R downloaded
+
+      - name: Unzip stapled app
+        run: |
+          unzip "downloaded/stapled-app.zip" -d extracted
+          ls -R extracted
+
+      # If the ZIP contains only "Contents", restore the proper .app bundle structure
+      - name: Restore .app structure if needed
+        run: |
+          if [ -d "extracted/Contents" ]; then
+            echo "Detected Contents folder only, reconstructing .app bundle..."
+            mkdir "TrackEx Agent.app"
+            mv extracted/Contents "TrackEx Agent.app/"
+          elif [ -d "extracted/TrackEx Agent.app" ]; then
+            echo ".app already exists"
+            mv extracted/TrackEx\ Agent.app .
+          fi
+          ls -R "TrackEx Agent.app"
+
+      # Create DMG file from the stapled app
+      - name: Create DMG from stapled app
+        run: |
+          echo "📦 Creating DMG..."
+          hdiutil create -volname "TrackEx Agent" \
+            -srcfolder "TrackEx Agent.app" \
+            -ov -format UDZO "TrackEx Agent.dmg"
+
+      # Upload the generated DMG as an artifact
+      - name: Upload DMG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stapled-dmg
+          path: TrackEx Agent.dmg
