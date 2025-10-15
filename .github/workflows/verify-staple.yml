@@ -1,0 +1,43 @@
+name: Verify and Staple Notarized App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-staple:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show notarization status
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "🔍 Checking notarization status for submission ID: 1b382565-8ce0-4e65-8d56-29bbdb34c228"
+          xcrun notarytool info 1b382565-8ce0-4e65-8d56-29bbdb34c228 \
+            --apple-id "$APPLE_ID" \
+            --password "$APP_PASSWORD" \
+            --team-id "$TEAM_ID"
+
+      - name: Unzip app
+        run: |
+          unzip "src-tauri/target/release/bundle/macos/TrackEx Agent.zip" -d extracted
+          ls extracted
+
+      - name: Staple to app
+        run: |
+          APP_PATH=$(find extracted -name "*.app" | head -n 1)
+          echo "📦 Found app at: $APP_PATH"
+          echo "🔩 Stapling notarization ticket..."
+          xcrun stapler staple "$APP_PATH"
+          echo "✅ Verifying stapled app..."
+          xcrun stapler validate "$APP_PATH"
+
+      - name: Upload stapled app
+        uses: actions/upload-artifact@v4
+        with:
+          name: stapled-app
+          path: extracted
