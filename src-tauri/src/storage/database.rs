@@ -5,16 +5,27 @@ use std::path::PathBuf;
 fn get_db_path() -> Result<PathBuf> {
     let mut path = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("Failed to get data directory"))?;
     path.push("TrackEx");
-    std::fs::create_dir_all(&path)?;
+    
+    // Create directory with better error handling
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        log::error!("Failed to create TrackEx data directory at {:?}: {}", path, e);
+        return Err(anyhow::anyhow!("Failed to create data directory: {}", e));
+    }
+    
     path.push("agent.db");
+    log::info!("Database path: {:?}", path);
     Ok(path)
 }
 
 pub async fn init() -> Result<()> {
+    log::info!("Initializing database...");
     let db_path = get_db_path()?;
+    log::info!("Opening database connection at {:?}", db_path);
     let conn = Connection::open(&db_path)?;
+    log::info!("Database connection opened successfully");
     
     // Create tables
+    log::info!("Creating database tables...");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS consent (
             id INTEGER PRIMARY KEY,
@@ -116,6 +127,7 @@ pub async fn init() -> Result<()> {
                 [],
             )?;
 
+    log::info!("Database initialized successfully");
     Ok(())
 }
 

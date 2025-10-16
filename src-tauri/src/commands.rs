@@ -355,8 +355,12 @@ pub async fn login(
     app_handle: tauri::AppHandle,
 ) -> Result<AuthStatus, String> {
     
-    // Create HTTP client
-    let client = reqwest::Client::new();
+    // Create HTTP client with timeout
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
     
     // Prepare login request
     let login_url = format!("{}/api/auth/employee-login", request.server_url.trim_end_matches('/'));
@@ -591,48 +595,66 @@ pub async fn get_auth_status(
         drop(app_state); // Release lock for async operation
     }
     
-    // Try to restore session from secure storage
-    if let Ok(Some(session_data)) = crate::storage::secure_store::get_session_data().await {
-        // Validate restored token with server
-        if let Ok(is_valid) = validate_token_with_server(&session_data.server_url, &session_data.device_token).await {
-            if is_valid {
-                let mut app_state = state.lock().await;
-                
-                // Restore ALL session data to memory
-                app_state.device_token = Some(session_data.device_token.clone());
-                app_state.email = Some(session_data.email.clone());
-                app_state.device_id = Some(session_data.device_id.clone());
-                app_state.server_url = Some(session_data.server_url.clone());
-                app_state.employee_id = session_data.employee_id.clone();
+    // Try to restore session from secure storage with timeout
+    let restore_result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::storage::secure_store::get_session_data()
+    ).await;
+    
+    match restore_result {
+        Ok(Ok(Some(session_data))) => {
+            log::info!("Found stored session, validating...");
+            // Validate restored token with server
+            if let Ok(is_valid) = validate_token_with_server(&session_data.server_url, &session_data.device_token).await {
+                if is_valid {
+                    let mut app_state = state.lock().await;
+                    
+                    // Restore ALL session data to memory
+                    app_state.device_token = Some(session_data.device_token.clone());
+                    app_state.email = Some(session_data.email.clone());
+                    app_state.device_id = Some(session_data.device_id.clone());
+                    app_state.server_url = Some(session_data.server_url.clone());
+                    app_state.employee_id = session_data.employee_id.clone();
 
-                // Sync device token to global app state for background services
-                if let Some(employee_id) = &session_data.employee_id {
-                    if let Err(e) = crate::storage::sync_device_token_to_global(
-                        session_data.device_token.clone(),
-                        session_data.device_id.clone(),
-                        session_data.email.clone(),
-                        session_data.server_url.clone(),
-                        employee_id.clone(),
-                    ).await {
-                        log::error!("Failed to sync device token to global state2: {}", e);
+                    // Sync device token to global app state for background services
+                    if let Some(employee_id) = &session_data.employee_id {
+                        if let Err(e) = crate::storage::sync_device_token_to_global(
+                            session_data.device_token.clone(),
+                            session_data.device_id.clone(),
+                            session_data.email.clone(),
+                            session_data.server_url.clone(),
+                            employee_id.clone(),
+                        ).await {
+                            log::error!("Failed to sync device token to global state2: {}", e);
+                        }
+
+                        // Start background services now that session is restored
+                        tokio::spawn(async move {
+                            crate::sampling::start_all_background_services(app_handle).await;
+                        });
                     }
-
-                    // Start background services now that session is restored
-                    tokio::spawn(async move {
-                        crate::sampling::start_all_background_services(app_handle).await;
+                    
+                    log::info!("Session restored successfully");
+                    return Ok(AuthStatus {
+                        is_authenticated: true,
+                        email: Some(session_data.email),
+                        device_id: Some(session_data.device_id),
                     });
+                } else {
+                    log::warn!("Stored token is invalid, clearing session");
+                    // Stored token is invalid, clear it
+                    let _ = crate::storage::secure_store::delete_session_data().await;
                 }
-                
-                
-                return Ok(AuthStatus {
-                    is_authenticated: true,
-                    email: Some(session_data.email),
-                    device_id: Some(session_data.device_id),
-                });
-            } else {
-                // Stored token is invalid, clear it
-                let _ = crate::storage::secure_store::delete_session_data().await;
             }
+        }
+        Ok(Ok(None)) => {
+            log::info!("No stored session found");
+        }
+        Ok(Err(e)) => {
+            log::error!("Error retrieving stored session: {}", e);
+        }
+        Err(_) => {
+            log::error!("Timeout retrieving stored session (keychain access may be blocked)");
         }
     }
     
@@ -646,7 +668,13 @@ pub async fn get_auth_status(
 
 // Helper function to validate token with server
 async fn validate_token_with_server(server_url: &str, token: &str) -> Result<bool, String> {
-    let client = reqwest::Client::new();
+    // Add timeout to prevent hanging
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    
     let url = format!("{}/api/auth/simple-session", server_url.trim_end_matches('/'));
     
     match client
@@ -660,7 +688,7 @@ async fn validate_token_with_server(server_url: &str, token: &str) -> Result<boo
             Ok(is_valid)
         }
         Err(e) => {
-            log::error!("Failed to validate token: {}", e);
+            log::warn!("Failed to validate token (offline?): {}", e);
             Ok(false) // Assume invalid if can't reach server
         }
     }
@@ -765,21 +793,45 @@ pub async fn accept_consent(version: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_consent_status() -> Result<ConsentStatus, String> {
-    // Initialize database first
-    if let Err(e) = crate::storage::database::init().await {
-        log::error!("Failed to initialize database: {}", e);
-        return Err(format!("Failed to initialize database: {}", e));
+    // Initialize database first with timeout
+    let db_init_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::storage::database::init()
+    ).await;
+    
+    match db_init_result {
+        Ok(Ok(_)) => {
+            log::info!("Database initialized successfully");
+        }
+        Ok(Err(e)) => {
+            log::error!("Failed to initialize database: {}", e);
+            return Err(format!("Failed to initialize database: {}", e));
+        }
+        Err(_) => {
+            log::error!("Timeout initializing database");
+            return Err("Database initialization timeout".to_string());
+        }
     }
     
-    match consent::get_consent_status().await {
-        Ok(status) => Ok(ConsentStatus {
+    // Get consent status with timeout
+    let consent_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        consent::get_consent_status()
+    ).await;
+    
+    match consent_result {
+        Ok(Ok(status)) => Ok(ConsentStatus {
             accepted: status.accepted,
             accepted_at: status.accepted_at.map(|dt| dt.to_rfc3339()),
             version: status.version,
         }),
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("Failed to get consent status: {}", e);
             Err(format!("Failed to get consent status: {}", e))
+        }
+        Err(_) => {
+            log::error!("Timeout getting consent status");
+            Err("Consent status check timeout".to_string())
         }
     }
 }

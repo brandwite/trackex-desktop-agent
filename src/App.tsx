@@ -36,9 +36,17 @@ function App() {
   const checkStatus = async () => {
     try {
       // ONLY check auth and consent on startup - NO PERMISSIONS
-      const [auth, consent] = await Promise.all([
-        invoke<AuthStatus>("get_auth_status"),
-        invoke<ConsentStatus>("get_consent_status")
+      // Add timeout to prevent hanging
+      const timeoutPromise = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error("Timeout checking status")), 15000)
+      );
+      
+      const [auth, consent] = await Promise.race([
+        Promise.all([
+          invoke<AuthStatus>("get_auth_status"),
+          invoke<ConsentStatus>("get_consent_status")
+        ]),
+        timeoutPromise
       ]);
 
       setAuthStatus(auth);
@@ -48,6 +56,11 @@ function App() {
       setPermissionsStatus(null);
     } catch (error) {
       console.error("Failed to check status:", error);
+      // On error, assume not authenticated and not consented
+      // This allows the app to show login screen instead of hanging
+      setAuthStatus({ is_authenticated: false });
+      setConsentStatus({ accepted: false, version: "1.0" });
+      setPermissionsStatus(null);
     } finally {
       setLoading(false);
     }

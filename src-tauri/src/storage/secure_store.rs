@@ -144,24 +144,35 @@ pub async fn get_session_data() -> Result<Option<SessionData>> {
     #[cfg(target_os = "macos")]
     {
         use keyring::Entry;
-        let entry = Entry::new(SERVICE_NAME, SESSION_DATA_KEY)?;
-        match entry.get_password() {
-            Ok(session_json) => {
-                match serde_json::from_str::<SessionData>(&session_json) {
-                    Ok(session) => {
-                        return Ok(Some(session));
+        log::info!("Attempting to retrieve session data from keychain...");
+        
+        match Entry::new(SERVICE_NAME, SESSION_DATA_KEY) {
+            Ok(entry) => {
+                match entry.get_password() {
+                    Ok(session_json) => {
+                        log::info!("Session data retrieved from keychain");
+                        match serde_json::from_str::<SessionData>(&session_json) {
+                            Ok(session) => {
+                                return Ok(Some(session));
+                            }
+                            Err(e) => {
+                                log::error!("Failed to parse session data: {}", e);
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                    Err(keyring::Error::NoEntry) => {
+                        log::info!("No session data found in keychain");
+                        return Ok(None);
                     }
                     Err(e) => {
-                        log::error!("Failed to parse session data: {}", e);
+                        log::error!("Failed to retrieve session data from keychain: {}", e);
                         return Err(e.into());
                     }
                 }
             }
-            Err(keyring::Error::NoEntry) => {
-                return Ok(None);
-            }
             Err(e) => {
-                log::error!("Failed to retrieve session data: {}", e);
+                log::error!("Failed to create keychain entry: {}", e);
                 return Err(e.into());
             }
         }
