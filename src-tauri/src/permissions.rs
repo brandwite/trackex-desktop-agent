@@ -89,29 +89,23 @@ async fn request_permissions_internal() -> Result<()> {
     
     #[cfg(target_os = "macos")]
     {
+        log::info!("Requesting screen recording permission...");
+        
         // Request screen recording permission
         if !has_screen_recording_permission().await {
-            let _ = ScreenCaptureAccess::default().request();
+            log::info!("Screen recording permission not granted, requesting...");
             
-            // Small delay between permission requests
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // The request() method triggers the permission dialog
+            let result = ScreenCaptureAccess::default().request();
+            log::info!("Screen recording permission request result: {:?}", result);
+            
+            // Small delay to allow dialog to appear
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        } else {
+            log::info!("Screen recording permission already granted");
         }
         
-        // Request microphone permission for audio recording
-        // This will trigger the microphone permission dialog
-        let _ = std::process::Command::new("ffmpeg")
-            .arg("-f")
-            .arg("avfoundation")
-            .arg("-list_devices")
-            .arg("true")
-            .arg("-i")
-            .arg("")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-            
-        
-        // Give macOS time to show permission dialogs
+        // Give macOS time to show permission dialogs and user to respond
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     }
     

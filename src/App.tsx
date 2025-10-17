@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import LoginScreen from "./components/LoginScreen";
 import ConsentWizard from "./components/ConsentWizard";
 import MainView from "./components/MainView";
-import PermissionsHelper from "./components/PermissionsHelper";
+// import PermissionsHelper from "./components/PermissionsHelper";
 import "./App.css";
 
 interface AuthStatus {
@@ -18,15 +18,15 @@ interface ConsentStatus {
   version: string;
 }
 
-interface PermissionsStatus {
-  screen_recording: boolean;
-  accessibility: boolean;
-}
+// interface PermissionsStatus {
+//   screen_recording: boolean;
+//   accessibility: boolean;
+// }
 
 function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [consentStatus, setConsentStatus] = useState<ConsentStatus | null>(null);
-  const [permissionsStatus, setPermissionsStatus] = useState<PermissionsStatus | null>(null);
+//   const [permissionsStatus, setPermissionsStatus] = useState<PermissionsStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -53,14 +53,14 @@ function App() {
       setConsentStatus(consent);
       
       // Don't check permissions on startup - only after explicit user action
-      setPermissionsStatus(null);
+      // setPermissionsStatus(null);
     } catch (error) {
       console.error("Failed to check status:", error);
       // On error, assume not authenticated and not consented
       // This allows the app to show login screen instead of hanging
       setAuthStatus({ is_authenticated: false });
       setConsentStatus({ accepted: false, version: "1.0" });
-      setPermissionsStatus(null);
+      // setPermissionsStatus(null);
     } finally {
       setLoading(false);
     }
@@ -82,7 +82,7 @@ function App() {
     // Clear auth status and refresh
     setAuthStatus(null);
     setConsentStatus(null);
-    setPermissionsStatus(null);
+    // setPermissionsStatus(null);
     setLoading(true);
     await checkStatus();
   };
@@ -106,43 +106,8 @@ function App() {
     return <ConsentWizard onConsent={handleConsent} />;
   }
 
-  // Check permissions only when user has completed login and consent
-  if (permissionsStatus === null) {
-    // Check permissions after login - this is when we first check them
-    const checkPermissions = async () => {
-      try {
-        const permissions = await invoke<PermissionsStatus>("get_permissions_status");
-        setPermissionsStatus(permissions);
-      } catch (error) {
-        console.error("Failed to check permissions:", error);
-        // If permission check fails, show main app anyway
-        setPermissionsStatus({ screen_recording: false, accessibility: false });
-      }
-    };
-    checkPermissions();
-    
-    return (
-      <div className="loading-container">
-        <div className="loading-spinner"></div>
-        <p>Checking system permissions...</p>
-      </div>
-    );
-  }
-
-  // Show permissions setup if screen recording not granted
-  if (!permissionsStatus.screen_recording) {
-    const handlePermissionsComplete = async () => {
-      const permissions = await invoke<PermissionsStatus>("get_permissions_status");
-      setPermissionsStatus(permissions);
-    };
-    
-    return <PermissionsHelper 
-      permissionsStatus={permissionsStatus} 
-      onPermissionsGranted={handlePermissionsComplete} 
-    />;
-  }
-
-  // Show main application only after all requirements met
+  // Skip permissions check for now - go straight to main app
+  // Show main application after login and consent
   return <MainView authStatus={authStatus} onLogout={handleLogout} />;
 }
 
