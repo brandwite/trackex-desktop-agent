@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tokio::time::Duration;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::sync::OnceLock;
 
 #[cfg(not(target_os = "windows"))]
 use anyhow::Result;
@@ -11,6 +14,25 @@ use anyhow::Result;
 use crate::commands::get_current_app;
 use crate::storage::app_usage;
 use crate::sampling::idle_detector;
+
+// Global state to track the last non-TrackEx app
+static LAST_NON_TRACKEX_APP: OnceLock<Arc<Mutex<Option<AppInfo>>>> = OnceLock::new();
+
+fn get_last_app_state() -> &'static Arc<Mutex<Option<AppInfo>>> {
+    LAST_NON_TRACKEX_APP.get_or_init(|| Arc::new(Mutex::new(None)))
+}
+
+pub async fn set_last_non_trackex_app(app: AppInfo) {
+    let state = get_last_app_state();
+    let mut last_app = state.lock().await;
+    *last_app = Some(app);
+}
+
+pub async fn get_last_non_trackex_app() -> Option<AppInfo> {
+    let state = get_last_app_state();
+    let last_app = state.lock().await;
+    last_app.clone()
+}
 
 // Unused imports removed for macOS - kept for future reference if needed
 // #[cfg(target_os = "macos")]
@@ -88,6 +110,11 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                     let is_idle = idle_time >= idle_threshold;
                     
                     if app_changed {
+                        log::info!("📱 App focus changed: {} ({})", app_info.name, app_info.app_id);
+                        
+                        // Trigger immediate heartbeat to reflect app change in real-time
+                        super::heartbeat::trigger_immediate_heartbeat().await;
+                        
                         // End previous session if it exists
                         if let Err(e) = app_usage::end_current_session().await {
                             log::warn!("Failed to end current app session: {}", e);
@@ -100,6 +127,8 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                             app_info.window_title.as_deref()
                         );
                         
+                        log::debug!("App classified as: {}", category);
+                        
                         // Start new session
                         if let Err(e) = app_usage::start_app_session(
                             app_info.name.clone(),
@@ -111,33 +140,42 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                             log::error!("Failed to start new app session: {}", e);
                         }
                         
+                        // Send app focus event ONLY when app changes
+                        let event_data = serde_json::json!({
+                            "app_name": app_info.name,
+                            "app_id": app_info.app_id,
+                            "window_title": app_info.window_title,
+                            "timestamp": chrono::Utc::now().to_rfc3339()
+                        });
+
+                        // Try to send immediately for real-time updates
+                        match crate::sampling::send_event_to_backend("app_focus", &event_data).await {
+                            Ok(_) => {
+                                log::info!("✓ App focus event sent: {}", app_info.name);
+                            }
+                            Err(e) => {
+                                // Only queue if immediate send fails (network issue, etc)
+                                log::warn!("Failed to send app focus event live, queuing: {}", e);
+                                if let Err(queue_err) = crate::storage::offline_queue::queue_event("app_focus", &event_data).await {
+                                    log::error!("CRITICAL: Failed to queue app focus event: {}", queue_err);
+                                } else {
+                                    log::debug!("App focus event queued for later delivery");
+                                }
+                            }
+                        }
+                        
                         last_app_info = Some(app_info.clone());
                     } else {
-                        // Update current session's idle status
+                        // App hasn't changed, just update current session's idle status
                         if let Err(e) = app_usage::update_current_session(is_idle).await {
                             log::warn!("Failed to update session idle status: {}", e);
                         }
                     }
-                    
-                    // Send app focus event live first, fallback to queue if failed
-                    let event_data = serde_json::json!({
-                        "app_name": app_info.name,
-                        "app_id": app_info.app_id,
-                        "window_title": app_info.window_title,
-                        "timestamp": chrono::Utc::now().to_rfc3339()
-                    });
-
-                    match crate::sampling::send_event_to_backend("app_focus", &event_data).await {
-                        Ok(_) => {
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to send app focus event live, queuing for later: {}", e);
-                            if let Err(e) = crate::storage::offline_queue::queue_event("app_focus", &event_data).await {
-                                log::error!("Failed to queue app focus event: {}", e);
-                            }
-                        }
-                    }
+                } else {
+                    log::trace!("No app detected in current check");
                 }
+        } else {
+            log::trace!("Failed to get current app");
         }
 
         interval.tick().await;
@@ -410,34 +448,65 @@ fn get_app_name_from_mapping(exe_path: &OsString) -> Option<String> {
     if let Some(path_str) = exe_path.to_str() {
         let path_lower = path_str.to_lowercase();
         
-        // Known app mappings
+        // Known app mappings - order matters, check specific apps first
+        // Cursor (check before generic 'code' check)
+        if path_lower.contains("cursor") {
+            return Some("Cursor".to_string());
+        }
+        // VS Code (be specific)
+        if path_lower.contains("code.exe") || (path_lower.contains("code") && path_lower.contains("microsoft")) {
+            return Some("Visual Studio Code".to_string());
+        }
+        // Browsers
         if path_lower.contains("firefox") {
             return Some("Mozilla Firefox".to_string());
         }
-        if path_lower.contains("chrome") {
+        if path_lower.contains("chrome") && !path_lower.contains("edge") {
             return Some("Google Chrome".to_string());
         }
-        if path_lower.contains("msedge") {
+        if path_lower.contains("msedge") || path_lower.contains("edge") {
             return Some("Microsoft Edge".to_string());
         }
-        if path_lower.contains("notepad") {
+        if path_lower.contains("brave") {
+            return Some("Brave Browser".to_string());
+        }
+        if path_lower.contains("opera") {
+            return Some("Opera".to_string());
+        }
+        // System apps
+        if path_lower.contains("notepad++") {
+            return Some("Notepad++".to_string());
+        }
+        if path_lower.contains("notepad") && !path_lower.contains("++") {
             return Some("Notepad".to_string());
         }
         if path_lower.contains("applicationframehost") {
             return None; // Let UWP detection handle this
         }
-        if path_lower.contains("cursor") {
-            return Some("Cursor".to_string());
-        }
-        if path_lower.contains("code") && path_lower.contains("visual studio") {
-            return Some("Visual Studio Code".to_string());
-        }
+        // IDEs and editors
         if path_lower.contains("devenv") {
             return Some("Visual Studio".to_string());
         }
-        if path_lower.contains("explorer") {
+        if path_lower.contains("pycharm") {
+            return Some("PyCharm".to_string());
+        }
+        if path_lower.contains("idea") && (path_lower.contains("jetbrains") || path_lower.contains("intellij")) {
+            return Some("IntelliJ IDEA".to_string());
+        }
+        if path_lower.contains("webstorm") {
+            return Some("WebStorm".to_string());
+        }
+        if path_lower.contains("sublime") {
+            return Some("Sublime Text".to_string());
+        }
+        if path_lower.contains("atom") {
+            return Some("Atom".to_string());
+        }
+        // File managers
+        if path_lower.contains("explorer.exe") || path_lower.contains("explorer") {
             return Some("File Explorer".to_string());
         }
+        // Microsoft Office
         if path_lower.contains("winword") {
             return Some("Microsoft Word".to_string());
         }
@@ -450,6 +519,7 @@ fn get_app_name_from_mapping(exe_path: &OsString) -> Option<String> {
         if path_lower.contains("outlook") {
             return Some("Microsoft Outlook".to_string());
         }
+        // Communication
         if path_lower.contains("teams") {
             return Some("Microsoft Teams".to_string());
         }
@@ -459,12 +529,17 @@ fn get_app_name_from_mapping(exe_path: &OsString) -> Option<String> {
         if path_lower.contains("discord") {
             return Some("Discord".to_string());
         }
+        if path_lower.contains("zoom") {
+            return Some("Zoom".to_string());
+        }
+        // Media
         if path_lower.contains("spotify") {
             return Some("Spotify".to_string());
         }
         if path_lower.contains("vlc") {
             return Some("VLC Media Player".to_string());
         }
+        // Adobe
         if path_lower.contains("photoshop") {
             return Some("Adobe Photoshop".to_string());
         }

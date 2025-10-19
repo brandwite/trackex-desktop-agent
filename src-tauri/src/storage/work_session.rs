@@ -89,6 +89,25 @@ pub async fn is_session_active() -> Result<bool> {
 }
 
 #[allow(dead_code)]
+pub async fn clear_all_active_sessions() -> Result<()> {
+    let conn = database::get_connection()?;
+    
+    let rows_affected = conn.execute(
+        "UPDATE work_sessions SET is_active = 0, ended_at = CURRENT_TIMESTAMP 
+         WHERE is_active = 1",
+        [],
+    )?;
+    
+    if rows_affected > 0 {
+        log::info!("Cleared {} active sessions from database", rows_affected);
+    } else {
+        log::info!("No active sessions to clear");
+    }
+    
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub async fn get_current_session_id() -> Result<Option<i64>> {
     let session = get_current_session().await?;
     Ok(session.map(|s| s.id))

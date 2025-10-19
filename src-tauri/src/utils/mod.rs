@@ -11,9 +11,6 @@ pub mod windows_imports {
         GetForegroundWindow,
         GetWindowTextW,
         GetWindowThreadProcessId,
-        GetWindow,
-        IsWindowVisible,
-        GW_HWNDNEXT,
     };
     pub use winapi::um::winver::{
         GetFileVersionInfoSizeW,

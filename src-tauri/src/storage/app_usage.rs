@@ -340,6 +340,32 @@ pub async fn load_recent_sessions(hours: i64) -> Result<()> {
     tracker.load_recent_sessions(hours).await
 }
 
+/// Reset the app usage tracker to clear any stale sessions
+pub async fn reset_tracker() -> Result<()> {
+    let mut tracker = APP_USAGE_TRACKER.lock().await;
+    // End any current session to prevent large duration calculations
+    if let Some(mut current) = tracker.current_session.take() {
+        let now = Utc::now();
+        current.end_time = Some(now);
+        current.duration_seconds = (now - current.start_time).num_seconds();
+        current.is_active = false;
+        
+        // Update totals
+        tracker.update_totals(&current);
+        
+        // Save to database
+        tracker.save_session_to_db(&current).await?;
+        
+        tracker.session_history.push(current);
+    }
+    
+    // Reset tracker to clean state
+    *tracker = AppUsageTracker::new();
+    
+    log::info!("App usage tracker reset successfully");
+    Ok(())
+}
+
 /// Handle system wake from sleep - mark idle time during sleep
 pub async fn handle_system_wake(_sleep_duration_seconds: u64) -> Result<()> {
     let mut tracker = APP_USAGE_TRACKER.lock().await;

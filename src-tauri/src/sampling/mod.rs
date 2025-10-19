@@ -4,6 +4,7 @@ pub mod app_focus;
 pub mod idle_detector;
 pub mod heartbeat;
 pub mod power_state;
+pub mod queue_processor;
 
 #[allow(dead_code)]
 pub fn is_dev_mode() -> bool {
@@ -15,16 +16,16 @@ pub fn get_app_focus_interval() -> u64 {
     if is_dev_mode() {
         1 // 1 second for development
     } else {
-        3 // 3 seconds for production
+        2 // 2 seconds for production - faster response
     }
 }
 
 #[allow(dead_code)]
 pub fn get_heartbeat_interval() -> u64 {
     if is_dev_mode() {
-        10 // 10 seconds for development
+        3 // 3 seconds for development - more real-time
     } else {
-        30 // 30 seconds for production
+        10 // 10 seconds for production - good balance between real-time and efficiency
     }
 }
 
@@ -76,6 +77,7 @@ pub struct BackgroundServiceState {
     pub app_focus_running: bool,
     pub heartbeat_running: bool,
     pub idle_detection_running: bool,
+    pub queue_processor_running: bool,
     pub last_app_check: Option<chrono::DateTime<chrono::Utc>>,
     pub last_heartbeat: Option<chrono::DateTime<chrono::Utc>>,
     pub last_idle_check: Option<chrono::DateTime<chrono::Utc>>,
@@ -87,6 +89,7 @@ impl BackgroundServiceState {
             app_focus_running: false,
             heartbeat_running: false,
             idle_detection_running: false,
+            queue_processor_running: false,
             last_app_check: None,
             last_heartbeat: None,
             last_idle_check: None,
@@ -193,8 +196,23 @@ pub async fn start_all_background_services(app_handle: tauri::AppHandle) {
     });
     
     // Start job polling
+    let app_handle4 = app_handle.clone();
     tokio::spawn(async move {
-        crate::api::job_polling::start_job_polling(app_handle).await;
+        crate::api::job_polling::start_job_polling(app_handle4).await;
+    });
+    
+    // Start offline queue processor (runs even after clock out for 1 min to send pending events)
+    let app_handle5 = app_handle.clone();
+    tokio::spawn(async move {
+        update_service_state(|state| {
+            state.queue_processor_running = true;
+        }).await;
+        
+        queue_processor::start_queue_processor(app_handle5).await;
+        
+        update_service_state(|state| {
+            state.queue_processor_running = false;
+        }).await;
     });
     
 }
@@ -204,8 +222,17 @@ static mut LAST_IDLE_STATE: bool = false;
 static mut IDLE_STATE_INITIALIZED: bool = false;
 
 #[allow(dead_code)]
+pub fn reset_idle_state() {
+    unsafe {
+        LAST_IDLE_STATE = false;
+        IDLE_STATE_INITIALIZED = false;
+    }
+    log::debug!("Idle state reset");
+}
+
+#[allow(dead_code)]
 async fn start_idle_detection_service(_app_handle: tauri::AppHandle) {
-    let interval_seconds = 5; // Check idle status every 5 seconds
+    let interval_seconds = 3; // Check idle status every 3 seconds for better responsiveness
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_seconds));
     let mut last_check_time = chrono::Utc::now();
@@ -274,8 +301,8 @@ async fn start_idle_detection_service(_app_handle: tauri::AppHandle) {
                 log::error!("Failed to update app session idle status: {}", e);
             }
             
-            // Send idle events only when status changes
-            if state_changed {
+            // Send idle events only when status changes AND user is clocked in
+            if state_changed && should_services_run().await {
                 let event_type = if is_idle { "idle_start" } else { "idle_end" };
                 let event_data = serde_json::json!({
                     "idle_time_seconds": idle_time,
@@ -297,6 +324,8 @@ async fn start_idle_detection_service(_app_handle: tauri::AppHandle) {
                         }
                     }
                 }
+            } else if state_changed {
+                log::debug!("Idle state changed but user not clocked in - skipping idle event");
             }
         }
 
@@ -472,18 +501,16 @@ pub async fn send_heartbeat_to_backend(heartbeat_data: &serde_json::Value) -> an
     // Get server URL and device token from storage
     let server_url = crate::storage::get_server_url().await?;
     let device_token = crate::storage::get_device_token().await?;
-    log::info!("Server URL: {}", server_url);
-    log::info!("Device token: {}", device_token);
-    if server_url.is_empty() || device_token.is_empty() {
-        log::warn!("🔍 Cannot send heartbeat: server_url or device_token is empty");
-        return Ok(());
-    }
     
-    // Log the heartbeat data being sent
+    if server_url.is_empty() || device_token.is_empty() {
+        log::warn!("Cannot send heartbeat: server_url or device_token is empty");
+        return Err(anyhow::anyhow!("Server URL or device token is empty"));
+    }
     
     let client = reqwest::Client::new();
     let heartbeat_url = format!("{}/api/ingest/heartbeat", server_url.trim_end_matches('/'));
     
+    log::trace!("Sending heartbeat to {}: {}", heartbeat_url, serde_json::to_string_pretty(heartbeat_data).unwrap_or_default());
     
     let response = client
         .post(&heartbeat_url)
@@ -493,13 +520,13 @@ pub async fn send_heartbeat_to_backend(heartbeat_data: &serde_json::Value) -> an
         .send()
         .await?;
     
-    
     if response.status().is_success() {
+        log::trace!("Heartbeat sent successfully (status: {})", response.status());
         Ok(())
     } else {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        log::error!("🔍 Heartbeat failed with status {}: {}", status, text);
+        log::error!("Heartbeat failed with status {}: {}", status, text);
         Err(anyhow::anyhow!("Heartbeat failed with status {}: {}", status, text))
     }
 }

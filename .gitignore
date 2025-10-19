@@ -24,3 +24,11 @@ dist-ssr
 *.sw?
 
 src-tauri/target
+
+.bmad-core/
+.bmad-creative-writing/
+.bmad-infrastructure-devops/
+.cursor/
+
+*_FIXES.md
+*_SUMMARY.md

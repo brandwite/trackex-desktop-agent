@@ -479,6 +479,16 @@ pub async fn login(
                         log::warn!("Failed to store device token securely: {}", e);
                     }
 
+                    // Clear any existing active sessions to ensure clean state
+                    if let Err(e) = crate::storage::work_session::clear_all_active_sessions().await {
+                        log::warn!("Failed to clear existing active sessions: {}", e);
+                    }
+
+                    // Reset app usage tracker to prevent stale sessions from causing large duration calculations
+                    if let Err(e) = crate::storage::app_usage::reset_tracker().await {
+                        log::warn!("Failed to reset app usage tracker: {}", e);
+                    }
+
 
                     return Ok(AuthStatus {
                         is_authenticated: true,
@@ -533,6 +543,18 @@ pub async fn logout(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), String
         state.employee_id = None;
         state.is_paused = false;
     }
+
+    // Stop all background services on logout
+    log::info!("Logout: Stopping all background services");
+    crate::sampling::stop_services().await;
+
+    // Reset app usage tracker to clear any active sessions
+    if let Err(e) = crate::storage::app_usage::reset_tracker().await {
+        log::warn!("Failed to reset app usage tracker on logout: {}", e);
+    }
+
+    // Reset idle state to prevent stale idle events
+    crate::sampling::reset_idle_state();
 
     // Clear stored session data
     if let Err(e) = crate::storage::secure_store::delete_session_data().await {
@@ -628,10 +650,19 @@ pub async fn get_auth_status(
                             log::error!("Failed to sync device token to global state2: {}", e);
                         }
 
-                        // Start background services now that session is restored
-                        tokio::spawn(async move {
-                            crate::sampling::start_all_background_services(app_handle).await;
-                        });
+                        // Clear any existing active sessions to ensure clean state
+                        if let Err(e) = crate::storage::work_session::clear_all_active_sessions().await {
+                            log::warn!("Failed to clear existing active sessions: {}", e);
+                        }
+
+                        // Reset app usage tracker to prevent stale sessions from causing large duration calculations
+                        if let Err(e) = crate::storage::app_usage::reset_tracker().await {
+                            log::warn!("Failed to reset app usage tracker: {}", e);
+                        }
+
+                        // DO NOT automatically start background services on session restore
+                        // Services should only start when user explicitly clocks in
+                        log::info!("Session restored successfully - services will start when user clocks in");
                     }
                     
                     log::info!("Session restored successfully");
@@ -883,7 +914,6 @@ pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri:
         // ✅ 3. Start background services now that user is clocked in
         log::info!("Clock in: Starting background services");
         tokio::spawn(async move {
-            crate::sampling::start_services().await;
             crate::sampling::start_all_background_services(app_handle).await;
         });
 
@@ -899,38 +929,74 @@ pub async fn clock_out(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), Str
     
     log::info!("Clock out: Ending local session");
     
-    // ✅ 0. Before stopping services, send final app_focus event to close current app usage
-    // This ensures the last app usage period is recorded in backend
-    // Get current app session to determine what app to close
-    if let Some(current_session) = crate::storage::app_usage::get_current_session().await {
-        let final_event_data = serde_json::json!({
-            "app_name": current_session.app_name,
-            "app_id": current_session.app_id,
-            "window_title": current_session.window_title,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        });
-        
-        // Try to send final app_focus event, queue if it fails
-        if let Err(e) = crate::sampling::send_event_to_backend("app_focus", &final_event_data).await {
-            log::warn!("Failed to send final app focus event, queuing: {}", e);
-            if let Err(e) = crate::storage::offline_queue::queue_event("app_focus", &final_event_data).await {
-                log::error!("Failed to queue final app focus event: {}", e);
-            }
-        }
-    }
-    
     // End local app usage session
     if let Err(e) = crate::storage::app_usage::end_current_session().await {
         log::warn!("Failed to end current app session: {}", e);
     }
     
-    // ✅ 1. Give queued events a moment to process before stopping
-    // Wait a bit for any queued events to be sent
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Send a final app focus event to ensure any open app usage entries are closed on the backend
+    // This prevents the issue where the last app usage entry remains open with endTime: null
+    if let Ok(Some(current_app)) = crate::commands::get_current_app().await {
+        log::info!("Clock out: Sending final app focus event to close open entries");
+        
+        let event_data = serde_json::json!({
+            "app_name": current_app.name,
+            "app_id": current_app.app_id,
+            "window_title": current_app.window_title,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        });
+
+        match crate::sampling::send_event_to_backend("app_focus", &event_data).await {
+            Ok(_) => {
+                log::info!("✓ Final app focus event sent to close open entries");
+            }
+            Err(e) => {
+                log::warn!("Failed to send final app focus event: {}", e);
+            }
+        }
+    }
     
-    // ✅ 2. Stop background services after sending final event
+    // ✅ 1. Process any remaining queued events before stopping services
+    log::info!("Clock out: Processing remaining queued events");
+    
+    // Process pending events
+    if let Ok(events) = crate::storage::offline_queue::get_pending_events().await {
+        for event in events {
+            match crate::sampling::send_event_to_backend(&event.event_type, &event.event_data).await {
+                Ok(_) => {
+                    let _ = crate::storage::offline_queue::mark_event_processed(event.id).await;
+                    log::info!("Clock out: Processed queued event {}", event.id);
+                }
+                Err(e) => {
+                    log::warn!("Clock out: Failed to send queued event {}: {}", event.id, e);
+                    let _ = crate::storage::offline_queue::mark_event_failed(event.id).await;
+                }
+            }
+        }
+    }
+    
+    // Process pending heartbeats
+    if let Ok(heartbeats) = crate::storage::offline_queue::get_pending_heartbeats().await {
+        for heartbeat in heartbeats {
+            match crate::sampling::send_heartbeat_to_backend(&heartbeat.heartbeat_data).await {
+                Ok(_) => {
+                    let _ = crate::storage::offline_queue::mark_heartbeat_processed(heartbeat.id).await;
+                    log::info!("Clock out: Processed queued heartbeat {}", heartbeat.id);
+                }
+                Err(e) => {
+                    log::warn!("Clock out: Failed to send queued heartbeat {}: {}", heartbeat.id, e);
+                    let _ = crate::storage::offline_queue::mark_heartbeat_failed(heartbeat.id).await;
+                }
+            }
+        }
+    }
+    
+    // ✅ 2. Stop background services after processing all queued events
     crate::sampling::stop_services().await;
     log::info!("Clock out: Background services stopped");
+
+    // Reset idle state to prevent stale idle events
+    crate::sampling::reset_idle_state();
     
     // ✅ 3. End LOCAL session
     crate::storage::work_session::end_session().await
@@ -971,25 +1037,6 @@ pub async fn clock_out(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), Str
             return Err(format!("Clock out failed: {}", error_text));
         }
         
-        // ✅ 4. After clock out, process any remaining queued events
-        // This ensures no data is lost if events were queued during the session
-        log::info!("Clock out: Processing remaining queued events");
-        
-        // Process pending events
-        if let Ok(events) = crate::storage::offline_queue::get_pending_events().await {
-            for event in events {
-                match crate::sampling::send_event_to_backend(&event.event_type, &event.event_data).await {
-                    Ok(_) => {
-                        let _ = crate::storage::offline_queue::mark_event_processed(event.id).await;
-                        log::info!("Clock out: Processed queued event {}", event.id);
-                    }
-                    Err(e) => {
-                        log::warn!("Clock out: Failed to send queued event {}: {}", event.id, e);
-                        let _ = crate::storage::offline_queue::mark_event_failed(event.id).await;
-                    }
-                }
-            }
-        }
 
     } else {
         return Err("Not authenticated. Please login first.".to_string());
@@ -1034,7 +1081,7 @@ pub async fn get_work_session(state: State<'_, Arc<Mutex<AppState>>>) -> Result<
                                 // Get current app for active session
                                 let current_app = match get_current_app().await {
                                     Ok(Some(app)) => Some(app.name),
-                                    _ => Some("TrackEx Agent".to_string())
+                                    _ => None
                                 };
                                 return Ok(WorkSessionInfo {
                                     is_active: true,
@@ -1058,7 +1105,7 @@ pub async fn get_work_session(state: State<'_, Arc<Mutex<AppState>>>) -> Result<
                     // Get current app for active session
                     let current_app = match get_current_app().await {
                         Ok(Some(app)) => Some(app.name),
-                        _ => Some("TrackEx Agent".to_string())
+                        _ => None
                     };
                     
                     return Ok(WorkSessionInfo {
@@ -1126,20 +1173,31 @@ fn is_trackex_agent(app_name: &str, app_id: &str, window_title: Option<&str>) ->
     let app_name_lower = app_name.to_lowercase();
     let app_id_lower = app_id.to_lowercase();
     
-    // Check app name
-    if app_name_lower.contains("trackex") && app_name_lower.contains("agent") {
+    // IMPORTANT: Be very specific to avoid false positives
+    // (e.g., Cursor with "trackex-desktop-agent" folder open shouldn't match)
+    
+    // Check app name - must be specifically "TrackEx Agent" or similar (not just containing the words)
+    if app_name_lower == "trackex agent" 
+        || app_name_lower == "trackex-agent" 
+        || app_name_lower == "trackex_agent" {
         return true;
     }
     
-    // Check app ID / bundle ID / executable name
-    if app_id_lower.contains("trackex-agent") || app_id_lower == "trackex-agent.exe" {
+    // Check app ID / bundle ID / executable name - must be the exact TrackEx executable
+    if app_id_lower == "trackex-agent.exe" 
+        || app_id_lower == "trackex_agent.exe"
+        || app_id_lower == "trackex-agent"
+        || app_id_lower == "trackex_agent"
+        || app_id_lower.starts_with("com.trackex.agent")
+        || app_id_lower.starts_with("com.nextup.trackex") {
         return true;
     }
     
-    // Check window title if available
+    // Check window title ONLY if it's exactly "TrackEx Agent" or "TrackEx"
+    // Do NOT check if it contains these words (to avoid false positives from folder names)
     if let Some(title) = window_title {
-        let title_lower = title.to_lowercase();
-        if title_lower == "trackex agent" || (title_lower.contains("trackex") && title_lower.contains("agent")) {
+        let title_lower = title.trim().to_lowercase();
+        if title_lower == "trackex agent" || title_lower == "trackex" {
             return true;
         }
     }
@@ -1147,152 +1205,11 @@ fn is_trackex_agent(app_name: &str, app_id: &str, window_title: Option<&str>) ->
     false
 }
 
-// Get the second app on macOS (when the first is TrackEx Agent)
-#[cfg(target_os = "macos")]
-fn get_second_app_macos() -> Result<Option<AppInfo>, String> {
-    use std::process::Command;
-    
-    // Get all visible application processes ordered by frontmost status
-    let processes_result = Command::new("osascript")
-        .arg("-e")
-        .arg("tell application \"System Events\" to get {name, bundle identifier} of every application process whose visible is true")
-        .output();
-    
-    match processes_result {
-        Ok(output) => {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = output_str.trim().split(',').collect();
-            
-            // The output is in format: name1, name2, ..., bundle1, bundle2, ...
-            // We need the second app (index 1)
-            if parts.len() >= 4 {
-                let names_count = parts.len() / 2;
-                if names_count >= 2 {
-                    let second_app_name = parts[1].trim();
-                    let second_bundle_id = parts[names_count + 1].trim();
-                    
-                    return Ok(Some(AppInfo {
-                        name: second_app_name.to_string(),
-                        app_id: second_bundle_id.to_string(),
-                        window_title: Some("Active Window".to_string()),
-                    }));
-                }
-            }
-            
-            // Fallback: return None if we can't get the second app
-            Ok(None)
-        }
-        Err(e) => {
-            log::warn!("Failed to get second app on macOS: {}", e);
-            Ok(None)
-        }
-    }
-}
-
-// Get the second window on Windows (when the first is TrackEx Agent)
-#[cfg(target_os = "windows")]
-fn get_second_app_windows(current_hwnd: windows::Win32::Foundation::HWND) -> Result<Option<AppInfo>, String> {
-    use crate::utils::windows_imports::*;
-    use sysinfo::System;
-    use crate::sampling::app_focus::get_windows_process_name;
-    
-    unsafe {
-        // Start from the current window and iterate through Z-order
-        let mut next_hwnd = current_hwnd;
-        
-        // Try to find the next visible, non-minimized window
-        for _ in 0..20 {  // Limit iterations to prevent infinite loops
-            match GetWindow(next_hwnd, GW_HWNDNEXT) {
-                Ok(hwnd) => next_hwnd = hwnd,
-                Err(_) => break,
-            }
-            
-            if next_hwnd.0 == std::ptr::null_mut() {
-                break;
-            }
-            
-            // Check if window is visible and not minimized
-            if !IsWindowVisible(next_hwnd).as_bool() {
-                continue;
-            }
-            
-            // Get window title
-            let mut title_buf = [0u16; 512];
-            let len = GetWindowTextW(next_hwnd, &mut title_buf);
-            
-            // Skip windows with no title
-            if len == 0 {
-                continue;
-            }
-            
-            let window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
-            let window_title = trim_nulls(&window_title);
-            
-            // Get process ID
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(next_hwnd, Some(&mut pid));
-            
-            if pid == 0 {
-                continue;
-            }
-            
-            // Get app info for this window
-            let mut app_name = None;
-            let mut app_id = None;
-            
-            if let Some(uwp_package) = crate::sampling::app_focus::get_uwp_app_from_window(next_hwnd) {
-                app_id = Some(uwp_package.clone());
-                
-                app_name = match uwp_package.as_str() {
-                    "Microsoft.WindowsCalculator_8wekyb3d8bbwe" => Some("Calculator".to_string()),
-                    "Microsoft.XboxGamingOverlay_8wekyb3d8bbwe" => Some("Xbox Game Bar".to_string()),
-                    "Microsoft.XboxApp_8wekyb3d8bbwe" => Some("Xbox".to_string()),
-                    "Microsoft.WindowsStore_8wekyb3d8bbwe" => Some("Microsoft Store".to_string()),
-                    "Microsoft.Windows.Settings_8wekyb3d8bbwe" => Some("Settings".to_string()),
-                    "Microsoft.Windows.ShellExperienceHost_cw5n1h2txyewy" => Some("Start Menu".to_string()),
-                    _ => Some(uwp_package),
-                };
-            }
-            
-            if app_name.is_none() {
-                let mut sys = System::new_all();
-                sys.refresh_all();
-                
-                if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                    let pid = process.pid().as_u32();
-                    if let Some(name) = get_windows_process_name(pid) {
-                        app_name = Some(trim_nulls(&name));
-                    } else {
-                        app_name = Some(trim_nulls(process.name()));
-                    }
-                }
-                
-                app_id = crate::sampling::app_focus::get_windows_app_id(pid);
-            }
-            
-            let final_app_name = app_name.unwrap_or_else(|| "Unknown".to_string());
-            let final_app_id = app_id.unwrap_or_else(|| format!("pid_{}", pid));
-            
-            // Make sure this isn't also TrackEx Agent
-            if is_trackex_agent(&final_app_name, &final_app_id, Some(&window_title)) {
-                continue;
-            }
-            
-            // Found a valid window that's not TrackEx Agent
-            return Ok(Some(AppInfo {
-                name: final_app_name,
-                app_id: final_app_id,
-                window_title: Some(window_title),
-            }));
-        }
-        
-        // No valid window found
-        Ok(None)
-    }
-}
-
 #[tauri::command]
 pub async fn get_current_app() -> Result<Option<AppInfo>, String> {
+    // Strategy: Return the focused app, but if TrackEx is focused, return the last non-TrackEx app.
+    // This ensures the UI always shows what the user is actually working on, even when viewing TrackEx.
+    
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -1314,23 +1231,34 @@ pub async fn get_current_app() -> Result<Option<AppInfo>, String> {
                 let bundle_id = String::from_utf8_lossy(&bundle_output.stdout).trim().to_string();
                 
                 if !name.is_empty() {
-                    // Check if this is the TrackEx Agent itself
-                    if is_trackex_agent(&name, &bundle_id, None) {
-                        // Get the second application in the list
-                        return get_second_app_macos();
-                    }
-                    
-                    return Ok(Some(AppInfo {
+                    let app_info = AppInfo {
                         name: name.to_string(),
                         app_id: bundle_id.to_string(),
                         window_title: Some("Active Window".to_string()),
-                    }));
+                    };
+                    
+                    // Check if this is the TrackEx Agent itself
+                    let is_trackex = is_trackex_agent(&name, &bundle_id, None);
+                    
+                    log::debug!("App detection (macOS): name='{}', id='{}', is_trackex={}", 
+                        name, bundle_id, is_trackex);
+                    
+                    if is_trackex {
+                        // Return the last non-TrackEx app instead
+                        log::debug!("TrackEx detected as foreground, returning last non-TrackEx app");
+                        return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
+                    }
+                    
+                    // Save this as the last non-TrackEx app
+                    crate::sampling::app_focus::set_last_non_trackex_app(app_info.clone()).await;
+                    return Ok(Some(app_info));
                 }
             }
             _ => {}
         }
         
-        return Ok(None);
+        // Fallback to last non-TrackEx app if detection failed
+        return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
     }
     
     #[cfg(target_os = "windows")]
@@ -1391,31 +1319,124 @@ pub async fn get_current_app() -> Result<Option<AppInfo>, String> {
 
                 if let Some(process) = sys.process(sysinfo::Pid::from_u32(pid)) {
                     let pid = process.pid().as_u32();
+                    
+                    // Try to get friendly name via Windows API first
                     if let Some(name) = get_windows_process_name(pid) {
                         app_name = Some(trim_nulls(&name));
+                        log::debug!("Got app name from get_windows_process_name: {}", name);
                     } else {
-                        app_name = Some(trim_nulls(process.name()));
+                        // Fallback: use sysinfo to get exe path and apply mapping
+                        log::debug!("get_windows_process_name returned None, using sysinfo fallback");
+                        
+                        // Try to get exe path from sysinfo
+                        if let Some(exe_path) = process.exe() {
+                            let exe_path_str = exe_path.to_string_lossy().to_string();
+                            log::debug!("Process exe path: {}", exe_path_str);
+                            
+                            // Apply the same mapping logic
+                            let exe_lower = exe_path_str.to_lowercase();
+                            
+                            // Check known app mappings (same as in app_focus.rs)
+                            if exe_lower.contains("cursor") {
+                                app_name = Some("Cursor".to_string());
+                            } else if exe_lower.contains("code.exe") || (exe_lower.contains("code") && exe_lower.contains("microsoft")) {
+                                app_name = Some("Visual Studio Code".to_string());
+                            } else if exe_lower.contains("chrome") && !exe_lower.contains("edge") {
+                                app_name = Some("Google Chrome".to_string());
+                            } else if exe_lower.contains("msedge") || (exe_lower.contains("edge") && !exe_lower.contains("edgeupdate")) {
+                                app_name = Some("Microsoft Edge".to_string());
+                            } else if exe_lower.contains("firefox") {
+                                app_name = Some("Mozilla Firefox".to_string());
+                            } else if exe_lower.contains("brave") {
+                                app_name = Some("Brave Browser".to_string());
+                            } else if exe_lower.contains("opera") {
+                                app_name = Some("Opera".to_string());
+                            } else if exe_lower.contains("explorer.exe") || exe_lower.ends_with("\\explorer.exe") {
+                                app_name = Some("File Explorer".to_string());
+                            } else if exe_lower.contains("notepad++") {
+                                app_name = Some("Notepad++".to_string());
+                            } else if exe_lower.contains("notepad.exe") && !exe_lower.contains("++") {
+                                app_name = Some("Notepad".to_string());
+                            } else if exe_lower.contains("devenv") {
+                                app_name = Some("Visual Studio".to_string());
+                            } else if exe_lower.contains("teams") {
+                                app_name = Some("Microsoft Teams".to_string());
+                            } else if exe_lower.contains("slack") {
+                                app_name = Some("Slack".to_string());
+                            } else if exe_lower.contains("discord") {
+                                app_name = Some("Discord".to_string());
+                            } else if exe_lower.contains("zoom") {
+                                app_name = Some("Zoom".to_string());
+                            } else if exe_lower.contains("spotify") {
+                                app_name = Some("Spotify".to_string());
+                            } else if exe_lower.contains("winword") {
+                                app_name = Some("Microsoft Word".to_string());
+                            } else if exe_lower.contains("excel") {
+                                app_name = Some("Microsoft Excel".to_string());
+                            } else if exe_lower.contains("powerpnt") {
+                                app_name = Some("Microsoft PowerPoint".to_string());
+                            } else if exe_lower.contains("outlook") {
+                                app_name = Some("Microsoft Outlook".to_string());
+                            } else {
+                                // Final fallback: clean filename
+                                if let Some(file_name) = exe_path.file_name() {
+                                    let name = file_name.to_string_lossy().to_string();
+                                    // Remove .exe extension
+                                    app_name = Some(if name.to_lowercase().ends_with(".exe") {
+                                        name[..name.len() - 4].to_string()
+                                    } else {
+                                        name
+                                    });
+                                }
+                            }
+                        }
+                        
+                        if app_name.is_none() {
+                            let proc_name = trim_nulls(process.name());
+                            log::debug!("Final fallback to process.name(): {}", proc_name);
+                            // Remove .exe extension if present
+                            app_name = Some(if proc_name.to_lowercase().ends_with(".exe") {
+                                proc_name[..proc_name.len() - 4].to_string()
+                            } else {
+                                proc_name
+                            });
+                        }
                     }
+                } else {
+                    log::warn!("Could not find process with PID: {}", pid);
                 }
                 
                 // Get app ID using Windows-specific logic
                 app_id = crate::sampling::app_focus::get_windows_app_id(pid);
             }
             
-            let final_app_name = app_name.unwrap_or_else(|| "Unknown".to_string());
+            let final_app_name = app_name.unwrap_or_else(|| {
+                log::warn!("No app name found, using Unknown");
+                "Unknown".to_string()
+            });
             let final_app_id = app_id.unwrap_or_else(|| format!("pid_{}", pid));
             
+            let app_info = AppInfo {
+                name: final_app_name.clone(),
+                app_id: final_app_id.clone(),
+                window_title: Some(window_title.clone()),
+            };
+            
             // Check if this is the TrackEx Agent itself
-            if is_trackex_agent(&final_app_name, &final_app_id, Some(&window_title)) {
-                // Get the next window beneath this one
-                return get_second_app_windows(hwnd);
+            let is_trackex = is_trackex_agent(&final_app_name, &final_app_id, Some(&window_title));
+            
+            log::debug!("App detection: name='{}', id='{}', title='{}', is_trackex={}", 
+                final_app_name, final_app_id, window_title, is_trackex);
+            
+            if is_trackex {
+                // Return the last non-TrackEx app instead
+                log::debug!("TrackEx detected as foreground, returning last non-TrackEx app");
+                return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
             }
             
-            Ok(Some(AppInfo {
-                name: final_app_name,
-                app_id: final_app_id,
-                window_title: Some(window_title),
-            }))
+            // Save this as the last non-TrackEx app
+            crate::sampling::app_focus::set_last_non_trackex_app(app_info.clone()).await;
+            Ok(Some(app_info))
         }
     }
     

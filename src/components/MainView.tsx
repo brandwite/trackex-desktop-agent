@@ -268,7 +268,7 @@ function MainView({ authStatus, onLogout }: Readonly<MainViewProps>) {
                 <div className="trackex-activity">
                     <div className="activity-item">
                         <span className="activity-label">Current App</span>
-                        <span className="activity-value">{currentApp?.name || "Unknown"}</span>
+                        <span className="activity-value">{currentApp?.name || "--"}</span>
                     </div>
                     <div className="activity-item">
                         <span className="activity-label">Status</span>

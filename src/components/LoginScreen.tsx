@@ -35,13 +35,8 @@ function LoginScreen({ onLogin }: LoginScreenProps) {
 
       await invoke("login", { request: loginRequest });
       
-      // Start background services after successful login
-      try {
-        await invoke("start_background_services");
-      } catch (error) {
-        console.error("Failed to start background services:", error);
-        // Don't fail the login if services fail to start
-      }
+      // DO NOT start background services after login
+      // Services should only start when user clocks in
       
       onLogin();
     } catch (error) {

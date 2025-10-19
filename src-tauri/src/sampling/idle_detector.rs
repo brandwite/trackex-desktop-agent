@@ -27,24 +27,35 @@ pub async fn get_idle_time() -> Result<u64> {
                 let output_str = String::from_utf8_lossy(&result.stdout);
                 
                 // Parse the idle time from ioreg output
+                // Look for "HIDIdleTime" = NUMBER
                 for line in output_str.lines() {
                     if line.contains("HIDIdleTime") {
-                        if let Some(start) = line.find('=') {
-                            if let Some(end) = line[start..].find(' ') {
-                                let idle_str = &line[start+1..start+end].trim();
-                                if let Ok(idle_ns) = idle_str.parse::<u64>() {
+                        // Extract the number after '='
+                        if let Some(equals_pos) = line.find('=') {
+                            let after_equals = &line[equals_pos + 1..];
+                            // Find the number (may have leading/trailing whitespace)
+                            let trimmed = after_equals.trim();
+                            // Split by space to get just the number
+                            if let Some(num_str) = trimmed.split_whitespace().next() {
+                                if let Ok(idle_ns) = num_str.parse::<u64>() {
                                     // Convert nanoseconds to seconds
-                                    return Ok(idle_ns / 1_000_000_000);
+                                    let idle_seconds = idle_ns / 1_000_000_000;
+                                    log::trace!("macOS idle time: {}s ({}ns)", idle_seconds, idle_ns);
+                                    return Ok(idle_seconds);
                                 }
                             }
                         }
                     }
                 }
+                // If we can't parse, log warning and return 0
+                log::trace!("Could not parse HIDIdleTime from ioreg output");
+            } else {
+                log::warn!("ioreg command failed with status: {:?}", result.status);
             }
             Ok(0)
         }
         Err(e) => {
-            log::error!("Failed to get idle time: {}", e);
+            log::error!("Failed to execute ioreg command: {}", e);
             Ok(0)
         }
     }
@@ -64,8 +75,11 @@ pub async fn get_idle_time() -> Result<u64> {
         if GetLastInputInfo(&mut last_input_info) != 0 {
             let current_time = GetTickCount();
             let idle_time_ms = current_time - last_input_info.dwTime;
-            return Ok(idle_time_ms as u64 / 1000) // Convert to seconds
+            let idle_seconds = idle_time_ms as u64 / 1000;
+            log::trace!("Windows idle time: {}s ({}ms)", idle_seconds, idle_time_ms);
+            return Ok(idle_seconds) // Convert to seconds
         } else {
+            log::warn!("GetLastInputInfo failed");
             return Ok(0)
         }
     }
