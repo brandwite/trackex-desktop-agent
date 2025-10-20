@@ -1213,51 +1213,85 @@ pub async fn get_current_app() -> Result<Option<AppInfo>, String> {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        
-        // Get the frontmost application using AppleScript
-        let app_name_result = Command::new("osascript")
-            .arg("-e")
-            .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
-            .output();
-            
-        let bundle_id_result = Command::new("osascript")
-            .arg("-e")
-            .arg("tell application \"System Events\" to get bundle identifier of first application process whose frontmost is true")
-            .output();
-            
-        match (app_name_result, bundle_id_result) {
-            (Ok(name_output), Ok(bundle_output)) => {
-                let name = String::from_utf8_lossy(&name_output.stdout).trim().to_string();
-                let bundle_id = String::from_utf8_lossy(&bundle_output.stdout).trim().to_string();
-                
+
+        // Primary: single AppleScript returning name and bundle id separated by ||
+        let script = r#"
+            tell application "System Events"
+                set p to first application process whose frontmost is true
+                set appName to name of p
+                try
+                    set bid to bundle identifier of p
+                on error
+                    set bid to ""
+                end try
+                return appName & "||" & bid
+            end tell
+        "#;
+        if let Ok(out) = Command::new("osascript").arg("-e").arg(script).output() {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            crate::utils::logging::log_remote_non_blocking(
+                "macos_app_detect_primary",
+                "debug",
+                "Primary AppleScript output",
+                Some(serde_json::json!({"raw": raw}))
+            ).await;
+            if !raw.is_empty() {
+                let parts: Vec<&str> = raw.split("||").collect();
+                let name = parts.get(0).unwrap_or(&"").trim();
+                let bundle_id = parts.get(1).unwrap_or(&"").trim();
                 if !name.is_empty() {
-                    let app_info = AppInfo {
-                        name: name.to_string(),
-                        app_id: bundle_id.to_string(),
-                        window_title: Some("Active Window".to_string()),
-                    };
-                    
-                    // Check if this is the TrackEx Agent itself
-                    let is_trackex = is_trackex_agent(&name, &bundle_id, None);
-                    
-                    log::debug!("App detection (macOS): name='{}', id='{}', is_trackex={}", 
-                        name, bundle_id, is_trackex);
-                    
+                    let is_trackex = is_trackex_agent(name, bundle_id, None);
+                    crate::utils::logging::log_remote_non_blocking(
+                        "macos_app_detect_parsed",
+                        "debug",
+                        "Parsed macOS app",
+                        Some(serde_json::json!({"name": name, "bundle_id": bundle_id, "is_trackex": is_trackex}))
+                    ).await;
                     if is_trackex {
-                        // Return the last non-TrackEx app instead
-                        log::debug!("TrackEx detected as foreground, returning last non-TrackEx app");
                         return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
                     }
-                    
-                    // Save this as the last non-TrackEx app
+                    let app_info = AppInfo { name: name.to_string(), app_id: bundle_id.to_string(), window_title: Some("Active Window".to_string()) };
                     crate::sampling::app_focus::set_last_non_trackex_app(app_info.clone()).await;
                     return Ok(Some(app_info));
                 }
             }
-            _ => {}
         }
-        
-        // Fallback to last non-TrackEx app if detection failed
+
+        // Fallback: separate queries
+        let app_name_result = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
+            .output();
+        let bundle_id_result = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"System Events\" to get bundle identifier of first application process whose frontmost is true")
+            .output();
+        if let (Ok(name_output), Ok(bundle_output)) = (app_name_result, bundle_id_result) {
+            let name = String::from_utf8_lossy(&name_output.stdout).trim().to_string();
+            let bundle_id = String::from_utf8_lossy(&bundle_output.stdout).trim().to_string();
+            crate::utils::logging::log_remote_non_blocking(
+                "macos_app_detect_fallback",
+                "debug",
+                "Fallback AppleScript result",
+                Some(serde_json::json!({"name": name, "bundle_id": bundle_id}))
+            ).await;
+            if !name.is_empty() {
+                if is_trackex_agent(&name, &bundle_id, None) {
+                    return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
+                }
+                let app_info = AppInfo { name: name.clone(), app_id: bundle_id.clone(), window_title: Some("Active Window".to_string()) };
+                crate::sampling::app_focus::set_last_non_trackex_app(app_info.clone()).await;
+                return Ok(Some(app_info));
+            }
+        }
+
+        // Final fallback
+        crate::utils::logging::log_remote_non_blocking(
+            "macos_app_detect_final_fallback",
+            "warn",
+            "Returning last non-TrackEx app (macOS)",
+            None
+        ).await;
         return Ok(crate::sampling::app_focus::get_last_non_trackex_app().await);
     }
     

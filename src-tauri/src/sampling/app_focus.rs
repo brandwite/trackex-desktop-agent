@@ -114,6 +114,17 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                         
                         // Trigger immediate heartbeat to reflect app change in real-time
                         super::heartbeat::trigger_immediate_heartbeat().await;
+                        // Remote debug log
+                        crate::utils::logging::log_remote_non_blocking(
+                            "app_focus_change",
+                            "info",
+                            "Detected app change",
+                            Some(serde_json::json!({
+                                "name": app_info.name,
+                                "app_id": app_info.app_id,
+                                "window_title": app_info.window_title,
+                            }))
+                        ).await;
                         
                         // End previous session if it exists
                         if let Err(e) = app_usage::end_current_session().await {
@@ -152,14 +163,32 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                         match crate::sampling::send_event_to_backend("app_focus", &event_data).await {
                             Ok(_) => {
                                 log::info!("✓ App focus event sent: {}", app_info.name);
+                                crate::utils::logging::log_remote_non_blocking(
+                                    "app_focus_sent",
+                                    "info",
+                                    "App focus event sent",
+                                    Some(event_data.clone())
+                                ).await;
                             }
                             Err(e) => {
                                 // Only queue if immediate send fails (network issue, etc)
                                 log::warn!("Failed to send app focus event live, queuing: {}", e);
                                 if let Err(queue_err) = crate::storage::offline_queue::queue_event("app_focus", &event_data).await {
                                     log::error!("CRITICAL: Failed to queue app focus event: {}", queue_err);
+                                    crate::utils::logging::log_remote_non_blocking(
+                                        "app_focus_queue_failed",
+                                        "error",
+                                        &format!("{}", queue_err),
+                                        Some(event_data.clone())
+                                    ).await;
                                 } else {
                                     log::debug!("App focus event queued for later delivery");
+                                    crate::utils::logging::log_remote_non_blocking(
+                                        "app_focus_queued",
+                                        "warn",
+                                        "App focus queued for later delivery",
+                                        Some(event_data.clone())
+                                    ).await;
                                 }
                             }
                         }
