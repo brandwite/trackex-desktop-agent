@@ -33,11 +33,11 @@ jobs:
         with:
           toolchain: stable
 
-      - name: 🧰 Install Tauri CLI (fixed version)
+      - name: 🧰 Install Tauri CLI (compatible version)
         run: |
           cargo uninstall tauri-cli || true
-          cargo install tauri-cli --version 2.8.1
-        # ⬆️ v2.8.1 fixes tauri-bundler's missing `Error` type issue
+          cargo install tauri-cli --version 2.7.0
+          # ⬆️ v2.7.0 avoids the tauri-macos-sign dependency conflict
 
       - name: 🔐 Import Apple Developer Certificate (.p12)
         run: |
