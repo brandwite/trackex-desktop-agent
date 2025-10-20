@@ -28,11 +28,16 @@ jobs:
       - name: 📦 Install dependencies
         run: npm ci
 
-      - name: 🦀 Set up Rust
+      - name: 🦀 Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
-      - name: 🧰 Install Tauri CLI
-        run: cargo install tauri-cli --version 2.8.0
+      - name: 🧰 Install Tauri CLI (fixed version)
+        run: |
+          cargo uninstall tauri-cli || true
+          cargo install tauri-cli --version 2.8.1
+        # ⬆️ v2.8.1 fixes tauri-bundler's missing `Error` type issue
 
       - name: 🔐 Import Apple Developer Certificate (.p12)
         run: |
@@ -55,25 +60,25 @@ jobs:
       - name: 🔍 List codesigning identities
         run: security find-identity -v -p codesigning
 
-      # 🏗️ Build, Sign, and Notarize in one step
-      - name: 🏗️ Build Tauri app (includes notarization)
+      - name: 🏗️ Build, Sign, and Notarize macOS app
         env:
-          # Required for Tauri's automatic notarization
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           CI: true
         run: |
-          echo "🏗️ Building macOS app with notarization..."
+          echo "🏗️ Building and notarizing TrackEx Agent for macOS..."
           npm run tauri build
 
-      - name: 🧪 Verify app signature and stapling
+      - name: 🧪 Verify code signature and stapling
         run: |
           APP_PATH="src-tauri/target/release/bundle/macos/TrackEx Agent.app"
           echo "🔏 Verifying code signature..."
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
           echo "🔍 Checking Gatekeeper assessment..."
           spctl --assess --type execute --verbose "$APP_PATH" || true
+
           echo "📎 Verifying stapling..."
           xcrun stapler validate "$APP_PATH" || true
 
