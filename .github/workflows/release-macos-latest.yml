@@ -35,9 +35,7 @@ jobs:
 
       - name: 🧰 Install Tauri CLI (latest stable)
         run: |
-          cargo uninstall tauri-cli || true
-          cargo install tauri-cli --version 2.9.0
-          # ⬆️ Try latest, fallback to 2.7.0 if needed
+          cargo install tauri-cli
 
       - name: 🔐 Import Apple Developer Certificate (.p12)
         run: |
