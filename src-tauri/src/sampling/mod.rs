@@ -507,7 +507,13 @@ pub async fn send_heartbeat_to_backend(heartbeat_data: &serde_json::Value) -> an
         return Err(anyhow::anyhow!("Server URL or device token is empty"));
     }
     
-    let client = reqwest::Client::new();
+    // Create HTTP client with proper timeout and retry configuration
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+    
     let heartbeat_url = format!("{}/api/ingest/heartbeat", server_url.trim_end_matches('/'));
     
     log::trace!("Sending heartbeat to {}: {}", heartbeat_url, serde_json::to_string_pretty(heartbeat_data).unwrap_or_default());
@@ -518,7 +524,16 @@ pub async fn send_heartbeat_to_backend(heartbeat_data: &serde_json::Value) -> an
         .header("Authorization", format!("Bearer {}", device_token))
         .json(heartbeat_data)
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                anyhow::anyhow!("Network error: Cannot connect to server. Please check your network connection.")
+            } else if e.is_timeout() {
+                anyhow::anyhow!("Network error: Request timeout. Please check your network connection.")
+            } else {
+                anyhow::anyhow!("Network error: {}", e)
+            }
+        })?;
     
     if response.status().is_success() {
         log::trace!("Heartbeat sent successfully (status: {})", response.status());
@@ -537,10 +552,17 @@ pub async fn send_event_to_backend(event_type: &str, event_data: &serde_json::Va
     let device_token = crate::storage::get_device_token().await?;
     
     if server_url.is_empty() || device_token.is_empty() {
+        log::warn!("Cannot send event: missing server URL or device token");
         return Ok(());
     }
     
-    let client = reqwest::Client::new();
+    // Create HTTP client with proper timeout and retry configuration
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+    
     let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
     
     let event_payload = serde_json::json!({
@@ -552,19 +574,32 @@ pub async fn send_event_to_backend(event_type: &str, event_data: &serde_json::Va
         }]
     });
     
+    log::debug!("Sending {} event to: {}", event_type, events_url);
+    
     let response = client
         .post(&events_url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", device_token))
         .json(&event_payload)
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is_connect() {
+                anyhow::anyhow!("Network error: Cannot connect to server. Please check your network connection.")
+            } else if e.is_timeout() {
+                anyhow::anyhow!("Network error: Request timeout. Please check your network connection.")
+            } else {
+                anyhow::anyhow!("Network error: {}", e)
+            }
+        })?;
     
     if response.status().is_success() {
+        log::debug!("✓ {} event sent successfully", event_type);
         Ok(())
     } else {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        log::warn!("Event failed with status {}: {}", status, text);
         Err(anyhow::anyhow!("Event failed with status {}: {}", status, text))
     }
 }

@@ -41,6 +41,15 @@ pub async fn get_idle_time() -> Result<u64> {
                                     // Convert nanoseconds to seconds
                                     let idle_seconds = idle_ns / 1_000_000_000;
                                     log::trace!("macOS idle time: {}s ({}ns)", idle_seconds, idle_ns);
+                                    crate::utils::logging::log_remote_non_blocking(
+                                        "idle_detection_macos",
+                                        "trace",
+                                        "macOS idle time detected",
+                                        Some(serde_json::json!({
+                                            "idle_seconds": idle_seconds,
+                                            "idle_nanoseconds": idle_ns
+                                        }))
+                                    ).await;
                                     return Ok(idle_seconds);
                                 }
                             }

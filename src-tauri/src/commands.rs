@@ -352,15 +352,39 @@ pub async fn trigger_sync() -> Result<String, String> {
 pub async fn login(
     request: LoginRequest,
     state: State<'_, Arc<Mutex<AppState>>>,
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
 ) -> Result<AuthStatus, String> {
+    
+    log::info!("Login attempt for email: {}", request.email);
+    crate::utils::logging::log_remote_non_blocking(
+        "login_start",
+        "info",
+        "Login attempt started",
+        Some(serde_json::json!({
+            "email": request.email,
+            "server_url": request.server_url
+        }))
+    ).await;
     
     // Create HTTP client with timeout
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| {
+            let error_msg = format!("Failed to create HTTP client: {}", e);
+            // Spawn async logging task
+            let error_json = serde_json::json!({"error": e.to_string()});
+            tokio::spawn(async move {
+                crate::utils::logging::log_remote_non_blocking(
+                    "login_client_error",
+                    "error",
+                    "Failed to create HTTP client",
+                    Some(error_json)
+                ).await;
+            });
+            error_msg
+        })?;
     
     // Prepare login request
     let login_url = format!("{}/api/auth/employee-login", request.server_url.trim_end_matches('/'));
@@ -370,6 +394,17 @@ pub async fn login(
     });
 
     // Make login request
+    log::debug!("Sending login request to: {}", login_url);
+    crate::utils::logging::log_remote_non_blocking(
+        "login_request",
+        "debug",
+        "Sending login request",
+        Some(serde_json::json!({
+            "url": login_url,
+            "email": request.email
+        }))
+    ).await;
+    
     let response = client
         .post(&login_url)
         .header("Content-Type", "application/json")
@@ -377,20 +412,59 @@ pub async fn login(
         .send()
         .await
         .map_err(|e| {
-            if e.is_connect() {
+            let error_msg = if e.is_connect() {
                 "Cannot connect to server. Please check your network connection.".to_string()
             } else if e.is_timeout() {
                 "Connection timeout. Please check your network connection.".to_string()
             } else {
                 format!("Network error: {}", e)
-            }
+            };
+            
+            // Spawn async logging task
+            let error_json = serde_json::json!({
+                "error": e.to_string(),
+                "error_type": if e.is_connect() { "connection" } else if e.is_timeout() { "timeout" } else { "other" }
+            });
+            tokio::spawn(async move {
+                crate::utils::logging::log_remote_non_blocking(
+                    "login_request_error",
+                    "error",
+                    "Login request failed",
+                    Some(error_json)
+                ).await;
+            });
+            
+            error_msg
         })?;
 
     if response.status().is_success() {
+        log::info!("Login request successful, parsing response");
+        crate::utils::logging::log_remote_non_blocking(
+            "login_response_success",
+            "info",
+            "Login request successful",
+            Some(serde_json::json!({
+                "status": response.status().as_u16()
+            }))
+        ).await;
+        
         let login_response: serde_json::Value = response
             .json()
             .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+            .map_err(|e| {
+                let error_msg = format!("Failed to parse response: {}", e);
+                // Spawn async logging task
+                let error_json = serde_json::json!({"error": e.to_string()});
+                tokio::spawn(async move {
+                    crate::utils::logging::log_remote_non_blocking(
+                        "login_parse_error",
+                        "error",
+                        "Failed to parse login response",
+                        Some(error_json)
+                    ).await;
+                });
+                error_msg
+            })?;
 
         if let Some(employee) = login_response.get("employee") {
             let employee_id = employee.get("id")
@@ -402,6 +476,18 @@ pub async fn login(
             let platform_name = get_platform_name();
             let os_version = get_os_version();
             
+            log::info!("Registering device for employee: {}", employee_id);
+            crate::utils::logging::log_remote_non_blocking(
+                "device_registration_start",
+                "info",
+                "Starting device registration",
+                Some(serde_json::json!({
+                    "employee_id": employee_id,
+                    "device_name": device_name,
+                    "platform": platform_name,
+                    "os_version": os_version
+                }))
+            ).await;
             
             let device_data = serde_json::json!({
                 "employeeId": employee_id,
@@ -412,19 +498,66 @@ pub async fn login(
             });
 
             let register_url = format!("{}/api/devices/employee-register", request.server_url.trim_end_matches('/'));
+            log::debug!("Sending device registration to: {}", register_url);
+            crate::utils::logging::log_remote_non_blocking(
+                "device_registration_request",
+                "debug",
+                "Sending device registration request",
+                Some(serde_json::json!({
+                    "url": register_url,
+                    "employee_id": employee_id
+                }))
+            ).await;
+            
             let device_response = client
                 .post(&register_url)
                 .header("Content-Type", "application/json")
                 .json(&device_data)
                 .send()
                 .await
-                .map_err(|e| format!("Device registration error: {}", e))?;
+                .map_err(|e| {
+                    let error_msg = format!("Device registration error: {}", e);
+                    // Spawn async logging task
+                    let error_json = serde_json::json!({"error": e.to_string()});
+                    tokio::spawn(async move {
+                        crate::utils::logging::log_remote_non_blocking(
+                            "device_registration_error",
+                            "error",
+                            "Device registration failed",
+                            Some(error_json)
+                        ).await;
+                    });
+                    error_msg
+                })?;
 
             if device_response.status().is_success() {
+                log::info!("Device registration successful");
+                crate::utils::logging::log_remote_non_blocking(
+                    "device_registration_success",
+                    "info",
+                    "Device registration successful",
+                    Some(serde_json::json!({
+                        "status": device_response.status().as_u16()
+                    }))
+                ).await;
+                
                 let device_result: serde_json::Value = device_response
                     .json()
                     .await
-                    .map_err(|e| format!("Failed to parse device response: {}", e))?;
+                    .map_err(|e| {
+                        let error_msg = format!("Failed to parse device response: {}", e);
+                        // Spawn async logging task
+                        let error_json = serde_json::json!({"error": e.to_string()});
+                        tokio::spawn(async move {
+                            crate::utils::logging::log_remote_non_blocking(
+                                "device_registration_parse_error",
+                                "error",
+                                "Failed to parse device registration response",
+                                Some(error_json)
+                            ).await;
+                        });
+                        error_msg
+                    })?;
 
                 if let Some(device) = device_result.get("device") {
                     let device_id = device.get("id")
@@ -456,10 +589,19 @@ pub async fn login(
                         log::error!("Failed to sync device token to global state1: {}", e);
                     }
 
-                    // Start background services now that authentication is complete
-                    tokio::spawn(async move {
-                        crate::sampling::start_all_background_services(app_handle).await;
-                    });
+                    // DO NOT start background services immediately after login
+                    // Services should only start when user explicitly clocks in
+                    log::info!("Login successful - services will start when user clocks in");
+                    crate::utils::logging::log_remote_non_blocking(
+                        "login_complete",
+                        "info",
+                        "Login completed successfully",
+                        Some(serde_json::json!({
+                            "email": request.email,
+                            "device_id": device_id,
+                            "employee_id": employee_id
+                        }))
+                    ).await;
 
                     // Store complete session data in secure storage for persistence
                     let session_data = crate::storage::secure_store::SessionData {
@@ -513,7 +655,7 @@ pub async fn login(
             _ => &error_text
         };
         
-        return Err(format!("Login failed ({}): {}", status, error_message));
+        return Err(format!("{}", error_message));
     }
 
     Err("Login failed".to_string())
@@ -701,8 +843,8 @@ pub async fn get_auth_status(
 async fn validate_token_with_server(server_url: &str, token: &str) -> Result<bool, String> {
     // Add timeout to prevent hanging
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
     
@@ -711,16 +853,28 @@ async fn validate_token_with_server(server_url: &str, token: &str) -> Result<boo
     match client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
         .send()
         .await
     {
         Ok(response) => {
             let is_valid = response.status().is_success();
+            if !is_valid {
+                log::warn!("Token validation failed with status: {}", response.status());
+            }
             Ok(is_valid)
         }
         Err(e) => {
-            log::warn!("Failed to validate token (offline?): {}", e);
-            Ok(false) // Assume invalid if can't reach server
+            if e.is_connect() {
+                log::warn!("Cannot connect to server for token validation: {}", e);
+            } else if e.is_timeout() {
+                log::warn!("Token validation timeout: {}", e);
+            } else {
+                log::warn!("Token validation error: {}", e);
+            }
+            // Return true to allow offline operation - user can still use the app
+            // The actual network operations will fail gracefully and queue data
+            Ok(true)
         }
     }
 }
@@ -870,11 +1024,38 @@ pub async fn get_consent_status() -> Result<ConsentStatus, String> {
 #[tauri::command]
 pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<(), String> {
     
+    log::info!("Clock in: Starting clock in process");
+    crate::utils::logging::log_remote_non_blocking(
+        "clock_in_start",
+        "info",
+        "Clock in process started",
+        None
+    ).await;
+    
     // ✅ 1. Save to LOCAL database first
     let session_id = crate::storage::work_session::start_session().await
-        .map_err(|e| format!("Failed to start local session: {}", e))?;
+        .map_err(|e| {
+            let error_msg = format!("Failed to start local session: {}", e);
+            // Spawn async logging task
+            let error_json = serde_json::json!({"error": e.to_string()});
+            tokio::spawn(async move {
+                crate::utils::logging::log_remote_non_blocking(
+                    "clock_in_local_session_error",
+                    "error",
+                    "Failed to start local session",
+                    Some(error_json)
+                ).await;
+            });
+            error_msg
+        })?;
     
     log::info!("Clock in: Local session started with ID {}", session_id);
+    crate::utils::logging::log_remote_non_blocking(
+        "clock_in_local_session_success",
+        "info",
+        "Local session started successfully",
+        Some(serde_json::json!({"session_id": session_id}))
+    ).await;
     
     let (server_url, device_token) = {
         let app_state = state.lock().await;
@@ -883,6 +1064,17 @@ pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri:
 
     if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
         // ✅ 2. Send clock_in event to REMOTE backend
+        log::info!("Clock in: Sending clock_in event to backend");
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_in_backend_request",
+            "info",
+            "Sending clock_in event to backend",
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "server_url": server_url
+            }))
+        ).await;
+        
         let client = reqwest::Client::new();
         let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
         
@@ -904,15 +1096,61 @@ pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri:
             .json(&event_data)
             .send()
             .await
-            .map_err(|e| format!("Network error: {}", e))?;
+            .map_err(|e| {
+                let error_msg = format!("Network error: {}", e);
+                // Spawn async logging task
+                let error_json = serde_json::json!({
+                    "error": e.to_string(),
+                    "session_id": session_id
+                });
+                tokio::spawn(async move {
+                    crate::utils::logging::log_remote_non_blocking(
+                        "clock_in_backend_error",
+                        "error",
+                        "Failed to send clock_in event to backend",
+                        Some(error_json)
+                    ).await;
+                });
+                error_msg
+            })?;
 
         if !response.status().is_success() {
+            let status_code = response.status().as_u16();
             let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Clock in failed: {}", error_text));
+            let error_msg = format!("Clock in failed: {}", error_text);
+            crate::utils::logging::log_remote_non_blocking(
+                "clock_in_backend_failed",
+                "error",
+                "Clock in backend request failed",
+                Some(serde_json::json!({
+                    "error": error_text,
+                    "status": status_code,
+                    "session_id": session_id
+                }))
+            ).await;
+            return Err(error_msg);
         }
+
+        log::info!("Clock in: Backend event sent successfully");
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_in_backend_success",
+            "info",
+            "Clock in backend event sent successfully",
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "status": response.status().as_u16()
+            }))
+        ).await;
 
         // ✅ 3. Start background services now that user is clocked in
         log::info!("Clock in: Starting background services");
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_in_services_start",
+            "info",
+            "Starting background services for clocked in user",
+            Some(serde_json::json!({"session_id": session_id}))
+        ).await;
+        
         tokio::spawn(async move {
             crate::sampling::start_all_background_services(app_handle).await;
         });
@@ -927,11 +1165,32 @@ pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri:
 #[tauri::command]
 pub async fn clock_out(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     
+    log::info!("Clock out: Starting clock out process");
+    crate::utils::logging::log_remote_non_blocking(
+        "clock_out_start",
+        "info",
+        "Clock out process started",
+        None
+    ).await;
+    
     log::info!("Clock out: Ending local session");
     
     // End local app usage session
     if let Err(e) = crate::storage::app_usage::end_current_session().await {
         log::warn!("Failed to end current app session: {}", e);
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_out_end_session_error",
+            "warn",
+            "Failed to end current app session",
+            Some(serde_json::json!({"error": e.to_string()}))
+        ).await;
+    } else {
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_out_end_session_success",
+            "info",
+            "Successfully ended current app session",
+            None
+        ).await;
     }
     
     // Send a final app focus event to ensure any open app usage entries are closed on the backend

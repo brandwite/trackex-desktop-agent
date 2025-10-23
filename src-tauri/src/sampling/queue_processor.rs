@@ -12,6 +12,12 @@ pub async fn start_queue_processor(_app_handle: AppHandle) {
     let mut interval = tokio::time::interval(processing_interval);
     
     log::info!("📦 Queue processor starting (interval: {}s)", processing_interval.as_secs());
+    crate::utils::logging::log_remote_non_blocking(
+        "queue_processor_start",
+        "info",
+        "Queue processor starting",
+        Some(serde_json::json!({"interval_seconds": processing_interval.as_secs()}))
+    ).await;
     
     loop {
         interval.tick().await;
@@ -22,6 +28,12 @@ pub async fn start_queue_processor(_app_handle: AppHandle) {
         if !is_clocked_in {
             // Not clocked in - stop immediately to prevent data corruption
             log::info!("Queue processor stopping - user clocked out or logged out");
+            crate::utils::logging::log_remote_non_blocking(
+                "queue_processor_stop",
+                "info",
+                "Queue processor stopping - user clocked out or logged out",
+                None
+            ).await;
             break;
         }
         
@@ -30,10 +42,22 @@ pub async fn start_queue_processor(_app_handle: AppHandle) {
             Ok(count) => {
                 if count > 0 {
                     log::info!("✓ Processed {} pending events", count);
+                    crate::utils::logging::log_remote_non_blocking(
+                        "queue_processor_events_success",
+                        "info",
+                        "Processed pending events",
+                        Some(serde_json::json!({"count": count}))
+                    ).await;
                 }
             }
             Err(e) => {
                 log::error!("Failed to process pending events: {}", e);
+                crate::utils::logging::log_remote_non_blocking(
+                    "queue_processor_events_error",
+                    "error",
+                    "Failed to process pending events",
+                    Some(serde_json::json!({"error": e.to_string()}))
+                ).await;
             }
         }
         
@@ -42,10 +66,22 @@ pub async fn start_queue_processor(_app_handle: AppHandle) {
             Ok(count) => {
                 if count > 0 {
                     log::info!("✓ Processed {} pending heartbeats", count);
+                    crate::utils::logging::log_remote_non_blocking(
+                        "queue_processor_heartbeats_success",
+                        "info",
+                        "Processed pending heartbeats",
+                        Some(serde_json::json!({"count": count}))
+                    ).await;
                 }
             }
             Err(e) => {
                 log::error!("Failed to process pending heartbeats: {}", e);
+                crate::utils::logging::log_remote_non_blocking(
+                    "queue_processor_heartbeats_error",
+                    "error",
+                    "Failed to process pending heartbeats",
+                    Some(serde_json::json!({"error": e.to_string()}))
+                ).await;
             }
         }
     }

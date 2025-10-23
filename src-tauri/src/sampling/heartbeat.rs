@@ -24,6 +24,12 @@ pub async fn trigger_immediate_heartbeat() {
     let mut triggered = trigger.lock().await;
     *triggered = true;
     log::debug!("Immediate heartbeat triggered");
+    crate::utils::logging::log_remote_non_blocking(
+        "heartbeat_immediate_trigger",
+        "debug",
+        "Immediate heartbeat triggered",
+        None
+    ).await;
 }
 
 #[allow(dead_code)]
@@ -33,6 +39,12 @@ pub async fn start_heartbeat_service(_app_handle: AppHandle) {
     let trigger = get_heartbeat_trigger();
     
     log::info!("Heartbeat service starting (interval: {}s)", interval_seconds);
+    crate::utils::logging::log_remote_non_blocking(
+        "heartbeat_service_start",
+        "info",
+        "Heartbeat service starting",
+        Some(serde_json::json!({"interval_seconds": interval_seconds}))
+    ).await;
     
     loop {
         // Wait for either the interval to tick or check for trigger periodically
@@ -72,12 +84,33 @@ pub async fn start_heartbeat_service(_app_handle: AppHandle) {
 
         // Send heartbeat - ALWAYS send, even when idle
         // The heartbeat includes the idle status, so the backend knows if user is active or idle
+        log::debug!("Sending heartbeat");
+        crate::utils::logging::log_remote_non_blocking(
+            "heartbeat_send_attempt",
+            "debug",
+            "Attempting to send heartbeat",
+            None
+        ).await;
+        
         match send_heartbeat().await {
             Ok(_) => {
                 // Heartbeat sent successfully
+                log::debug!("Heartbeat sent successfully");
+                crate::utils::logging::log_remote_non_blocking(
+                    "heartbeat_send_success",
+                    "debug",
+                    "Heartbeat sent successfully",
+                    None
+                ).await;
             }
             Err(e) => {
                 log::error!("Failed to send heartbeat (will retry on next interval): {}", e);
+                crate::utils::logging::log_remote_non_blocking(
+                    "heartbeat_send_error",
+                    "error",
+                    "Failed to send heartbeat",
+                    Some(serde_json::json!({"error": e.to_string()}))
+                ).await;
                 // Don't break - continue sending heartbeats on next interval
             }
         }
