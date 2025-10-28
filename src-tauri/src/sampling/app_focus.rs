@@ -9,7 +9,6 @@ use std::sync::OnceLock;
 use anyhow::Result;
 
 // use crate::storage::app_usage;
-// use crate::api::app_rules;
 
 use crate::commands::get_current_app;
 use crate::storage::app_usage;
@@ -63,7 +62,6 @@ use crate::utils::windows_imports::*;
 // #[cfg(target_os = "windows")]
 // use winapi::um::handleapi::CloseHandle;
 
-use crate::utils::productivity::ProductivityClassifier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppInfo {
@@ -76,8 +74,7 @@ pub struct AppInfo {
 pub async fn start_sampling(_app_handle: AppHandle) {
     let interval_seconds = super::get_app_focus_interval();
 
-    // Initialize app usage tracker and productivity classifier
-    let classifier = ProductivityClassifier::with_default_rules();
+    // Initialize app usage tracker
     
     // Wait a bit for database initialization to complete
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -131,21 +128,11 @@ pub async fn start_sampling(_app_handle: AppHandle) {
                             log::warn!("Failed to end current app session: {}", e);
                         }
                         
-                        // Classify the new app
-                        let category = classifier.classify_app(
-                            &app_info.name, 
-                            &app_info.app_id, 
-                            app_info.window_title.as_deref()
-                        );
-                        
-                        log::debug!("App classified as: {}", category);
-                        
-                        // Start new session
+                        // Start new session (category classification handled by backend)
                         if let Err(e) = app_usage::start_app_session(
                             app_info.name.clone(),
                             app_info.app_id.clone(),
                             app_info.window_title.clone(),
-                            category.clone(),
                             is_idle,
                         ).await {
                             log::error!("Failed to start new app session: {}", e);

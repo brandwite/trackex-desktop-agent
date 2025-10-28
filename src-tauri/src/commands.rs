@@ -26,7 +26,7 @@ pub struct ConsentStatus {
     pub version: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkSessionInfo {
     pub is_active: bool,
     pub started_at: Option<String>,
@@ -355,7 +355,6 @@ pub async fn login(
     _app_handle: tauri::AppHandle,
 ) -> Result<AuthStatus, String> {
     
-    log::info!("Login attempt for email: {}", request.email);
     crate::utils::logging::log_remote_non_blocking(
         "login_start",
         "info",
@@ -386,11 +385,20 @@ pub async fn login(
             error_msg
         })?;
     
-    // Prepare login request
+    // Get device information for login
+    let device_name = get_device_name();
+    let platform_name = get_platform_name();
+    let os_version = get_os_version();
+    
+    // Prepare login request with device information
     let login_url = format!("{}/api/auth/employee-login", request.server_url.trim_end_matches('/'));
     let login_data = serde_json::json!({
         "email": request.email,
-        "password": request.password
+        "password": request.password,
+        "deviceName": device_name,
+        "platform": platform_name,
+        "version": os_version,
+        "appVersion": env!("CARGO_PKG_VERSION")
     });
 
     // Make login request
@@ -401,7 +409,10 @@ pub async fn login(
         "Sending login request",
         Some(serde_json::json!({
             "url": login_url,
-            "email": request.email
+            "email": request.email,
+            "device_name": device_name,
+            "platform": platform_name,
+            "os_version": os_version
         }))
     ).await;
     
@@ -413,9 +424,9 @@ pub async fn login(
         .await
         .map_err(|e| {
             let error_msg = if e.is_connect() {
-                "Cannot connect to server. Please check your network connection.".to_string()
+                "Cannot connect to server. Please check your network connection and try again.".to_string()
             } else if e.is_timeout() {
-                "Connection timeout. Please check your network connection.".to_string()
+                "Connection timeout. Please check your network connection and try again.".to_string()
             } else {
                 format!("Network error: {}", e)
             };
@@ -471,102 +482,140 @@ pub async fn login(
                 .and_then(|v| v.as_str())
                 .ok_or("Missing employee ID")?;
 
-            // Now register device for this employee
-            let device_name = get_device_name();
-            let platform_name = get_platform_name();
-            let os_version = get_os_version();
-            
-            log::info!("Registering device for employee: {}", employee_id);
-            crate::utils::logging::log_remote_non_blocking(
-                "device_registration_start",
-                "info",
-                "Starting device registration",
-                Some(serde_json::json!({
-                    "employee_id": employee_id,
-                    "device_name": device_name,
-                    "platform": platform_name,
-                    "os_version": os_version
-                }))
-            ).await;
-            
-            let device_data = serde_json::json!({
-                "employeeId": employee_id,
-                "deviceName": device_name,
-                "platform": platform_name,
-                "osVersion": os_version,
-                "appVersion": env!("CARGO_PKG_VERSION")
-            });
-
-            let register_url = format!("{}/api/devices/employee-register", request.server_url.trim_end_matches('/'));
-            log::debug!("Sending device registration to: {}", register_url);
-            crate::utils::logging::log_remote_non_blocking(
-                "device_registration_request",
-                "debug",
-                "Sending device registration request",
-                Some(serde_json::json!({
-                    "url": register_url,
-                    "employee_id": employee_id
-                }))
-            ).await;
-            
-            let device_response = client
-                .post(&register_url)
-                .header("Content-Type", "application/json")
-                .json(&device_data)
-                .send()
-                .await
-                .map_err(|e| {
-                    let error_msg = format!("Device registration error: {}", e);
-                    // Spawn async logging task
-                    let error_json = serde_json::json!({"error": e.to_string()});
-                    tokio::spawn(async move {
-                        crate::utils::logging::log_remote_non_blocking(
-                            "device_registration_error",
-                            "error",
-                            "Device registration failed",
-                            Some(error_json)
-                        ).await;
-                    });
-                    error_msg
-                })?;
-
-            if device_response.status().is_success() {
-                log::info!("Device registration successful");
+            // Check if device credentials are already in the login response
+            let (device_id, device_token) = if let Some(device) = login_response.get("device") {
+                // Handle device data from API response
+                let device_id = device.get("device_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing device_id in device object")?;
+                
+                // Check if we have a token or need to handle existing token
+                if let Some(device_token) = device.get("device_token").and_then(|v| v.as_str()) {
+                    // New token provided
+                    log::info!("Device registered with new token");
+                    crate::utils::logging::log_remote_non_blocking(
+                        "device_new_token",
+                        "info",
+                        "Device registered with new token",
+                        Some(serde_json::json!({
+                            "device_id": device_id,
+                            "employee_id": employee_id
+                        }))
+                    ).await;
+                    (device_id.to_string(), device_token.to_string())
+                } else if device.get("token_exists").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    // Token exists but not provided - need to fetch it separately
+                    log::info!("Device exists but token not provided, need to fetch token");
+                    return Err("Device token exists but not provided. Please contact support.".to_string());
+                } else {
+                    return Err("Invalid device response format".to_string());
+                }
+            } else {
+                // Device not registered, need to register it
+                log::info!("Device not registered, registering new device for employee: {}", employee_id);
                 crate::utils::logging::log_remote_non_blocking(
-                    "device_registration_success",
+                    "device_registration_start",
                     "info",
-                    "Device registration successful",
+                    "Starting device registration",
                     Some(serde_json::json!({
-                        "status": device_response.status().as_u16()
+                        "employee_id": employee_id,
+                        "device_name": device_name,
+                        "platform": platform_name,
+                        "os_version": os_version
                     }))
                 ).await;
                 
-                let device_result: serde_json::Value = device_response
-                    .json()
+                let device_data = serde_json::json!({
+                    "employeeId": employee_id,
+                    "deviceName": device_name,
+                    "platform": platform_name,
+                    "version": os_version,
+                    "appVersion": env!("CARGO_PKG_VERSION")
+                });
+
+                let register_url = format!("{}/api/devices/employee-register", request.server_url.trim_end_matches('/'));
+                log::debug!("Sending device registration to: {}", register_url);
+                crate::utils::logging::log_remote_non_blocking(
+                    "device_registration_request",
+                    "debug",
+                    "Sending device registration request",
+                    Some(serde_json::json!({
+                        "url": register_url,
+                        "employee_id": employee_id,
+                        "device_name": device_name,
+                        "platform": platform_name,
+                        "os_version": os_version
+                    }))
+                ).await;
+                
+                let device_response = client
+                    .post(&register_url)
+                    .header("Content-Type", "application/json")
+                    .json(&device_data)
+                    .send()
                     .await
                     .map_err(|e| {
-                        let error_msg = format!("Failed to parse device response: {}", e);
+                        let error_msg = format!("Device registration error: {}", e);
                         // Spawn async logging task
                         let error_json = serde_json::json!({"error": e.to_string()});
                         tokio::spawn(async move {
                             crate::utils::logging::log_remote_non_blocking(
-                                "device_registration_parse_error",
+                                "device_registration_error",
                                 "error",
-                                "Failed to parse device registration response",
+                                "Device registration failed",
                                 Some(error_json)
                             ).await;
                         });
                         error_msg
                     })?;
 
-                if let Some(device) = device_result.get("device") {
-                    let device_id = device.get("id")
-                        .and_then(|v| v.as_str())
-                        .ok_or("Missing device ID")?;
+                if device_response.status().is_success() {
+                    log::info!("Device registration successful");
+                    crate::utils::logging::log_remote_non_blocking(
+                        "device_registration_success",
+                        "info",
+                        "Device registration successful",
+                        Some(serde_json::json!({
+                            "status": device_response.status().as_u16()
+                        }))
+                    ).await;
+                    
+                    let device_result: serde_json::Value = device_response
+                        .json()
+                        .await
+                        .map_err(|e| {
+                            let error_msg = format!("Failed to parse device response: {}", e);
+                            // Spawn async logging task
+                            let error_json = serde_json::json!({"error": e.to_string()});
+                            tokio::spawn(async move {
+                                crate::utils::logging::log_remote_non_blocking(
+                                    "device_registration_parse_error",
+                                    "error",
+                                    "Failed to parse device registration response",
+                                    Some(error_json)
+                                ).await;
+                            });
+                            error_msg
+                        })?;
 
-                    let device_token = device.get("token")
-                        .and_then(|v| v.as_str())
-                        .ok_or("Missing device token")?;
+                    if let Some(device) = device_result.get("device") {
+                        let device_id = device.get("device_id")
+                            .and_then(|v| v.as_str())
+                            .ok_or("Missing device_id in registration response")?;
+
+                        let device_token = device.get("device_token")
+                            .and_then(|v| v.as_str())
+                            .ok_or("Missing device_token in registration response")?;
+                        
+                        (device_id.to_string(), device_token.to_string())
+                    } else {
+                        return Err("Invalid device registration response".to_string());
+                    }
+                } else {
+                    let error_text = device_response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                    return Err(format!("Device registration failed: {}", error_text));
+                }
+            };
 
                     // Store credentials securely
                     {
@@ -589,9 +638,17 @@ pub async fn login(
                         log::error!("Failed to sync device token to global state1: {}", e);
                     }
 
-                    // DO NOT start background services immediately after login
-                    // Services should only start when user explicitly clocks in
-                    log::info!("Login successful - services will start when user clocks in");
+                    // Start background services if a work session is already active
+                    if crate::storage::work_session::is_session_active().await.unwrap_or(false) {
+                        log::info!("Login successful - active work session detected, starting background services");
+                        let app_handle_clone = _app_handle.clone();
+                        tokio::spawn(async move {
+                            crate::sampling::start_all_background_services(app_handle_clone).await;
+                        });
+                    } else {
+                        // Otherwise, services will start when the user clocks in
+                        log::info!("Login successful - services will start when user clocks in");
+                    }
                     crate::utils::logging::log_remote_non_blocking(
                         "login_complete",
                         "info",
@@ -621,10 +678,7 @@ pub async fn login(
                         log::warn!("Failed to store device token securely: {}", e);
                     }
 
-                    // Clear any existing active sessions to ensure clean state
-                    if let Err(e) = crate::storage::work_session::clear_all_active_sessions().await {
-                        log::warn!("Failed to clear existing active sessions: {}", e);
-                    }
+                    // Do not clear active sessions on login; respect existing clock-in state
 
                     // Reset app usage tracker to prevent stale sessions from causing large duration calculations
                     if let Err(e) = crate::storage::app_usage::reset_tracker().await {
@@ -637,11 +691,6 @@ pub async fn login(
                         email: Some(request.email),
                         device_id: Some(device_id.to_string()),
                     });
-                }
-            } else {
-                let error_text = device_response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                return Err(format!("Device registration failed: {}", error_text));
-            }
         }
     } else {
         let status = response.status();
@@ -880,6 +929,33 @@ async fn validate_token_with_server(server_url: &str, token: &str) -> Result<boo
 }
 
 #[tauri::command]
+pub async fn update_logging_config(enabled: bool, debug_mode: bool, allowed_levels: Vec<String>) -> Result<(), String> {
+    crate::utils::logging::update_remote_logging_config(enabled, debug_mode, allowed_levels);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_logging_config() -> Result<serde_json::Value, String> {
+    let (enabled, debug_mode, levels) = crate::utils::logging::get_remote_logging_config();
+    Ok(serde_json::json!({
+        "enabled": enabled,
+        "debug_mode": debug_mode,
+        "allowed_levels": levels
+    }))
+}
+
+#[tauri::command]
+pub async fn sync_logging_config() -> Result<(), String> {
+    crate::utils::logging::sync_logging_config_now().await
+}
+
+#[tauri::command]
+pub async fn start_logging_sync_service() -> Result<(), String> {
+    crate::utils::logging::start_logging_config_sync_service().await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn clear_local_database() -> Result<(), String> {
     log::info!("Clearing local database...");
     let conn = crate::storage::database::get_connection()
@@ -912,12 +988,12 @@ pub async fn clear_local_database() -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_recent_sessions(state: State<'_, Arc<Mutex<AppState>>>) -> Result<serde_json::Value, String> {
-    let (server_url, device_token) = {
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
         let client = reqwest::Client::new();
         
         // Call real API to get recent sessions
@@ -926,6 +1002,7 @@ pub async fn get_recent_sessions(state: State<'_, Arc<Mutex<AppState>>>) -> Resu
         match client
             .get(&url)
             .header("Authorization", format!("Bearer {}", device_token))
+            .header("X-Device-ID", device_id)
             .send()
             .await
         {
@@ -1025,140 +1102,107 @@ pub async fn get_consent_status() -> Result<ConsentStatus, String> {
 pub async fn clock_in(state: State<'_, Arc<Mutex<AppState>>>, app_handle: tauri::AppHandle) -> Result<(), String> {
     
     log::info!("Clock in: Starting clock in process");
-    crate::utils::logging::log_remote_non_blocking(
-        "clock_in_start",
-        "info",
-        "Clock in process started",
-        None
-    ).await;
     
-    // ✅ 1. Save to LOCAL database first
+    // ✅ 1. Save to LOCAL database first (this is the critical part)
     let session_id = crate::storage::work_session::start_session().await
         .map_err(|e| {
             let error_msg = format!("Failed to start local session: {}", e);
-            // Spawn async logging task
-            let error_json = serde_json::json!({"error": e.to_string()});
-            tokio::spawn(async move {
-                crate::utils::logging::log_remote_non_blocking(
-                    "clock_in_local_session_error",
-                    "error",
-                    "Failed to start local session",
-                    Some(error_json)
-                ).await;
-            });
             error_msg
         })?;
     
     log::info!("Clock in: Local session started with ID {}", session_id);
-    crate::utils::logging::log_remote_non_blocking(
-        "clock_in_local_session_success",
-        "info",
-        "Local session started successfully",
-        Some(serde_json::json!({"session_id": session_id}))
-    ).await;
     
-    let (server_url, device_token) = {
+    // ✅ 2. Start background services immediately (don't wait for backend)
+    log::info!("Clock in: Starting background services");
+    let app_handle_clone = app_handle.clone();
+    tokio::spawn(async move {
+        crate::sampling::start_all_background_services(app_handle_clone).await;
+    });
+    
+    // ✅ 3. Handle backend communication asynchronously (don't block clock-in)
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
-        // ✅ 2. Send clock_in event to REMOTE backend
-        log::info!("Clock in: Sending clock_in event to backend");
-        crate::utils::logging::log_remote_non_blocking(
-            "clock_in_backend_request",
-            "info",
-            "Sending clock_in event to backend",
-            Some(serde_json::json!({
-                "session_id": session_id,
-                "server_url": server_url
-            }))
-        ).await;
-        
-        let client = reqwest::Client::new();
-        let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
-        
-        let event_data = serde_json::json!({
-            "events": [{
-                "type": "clock_in",
-                "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                "data": {
-                    "session_id": session_id,
-                    "source": "desktop_agent"
-                }
-            }]
-        });
-
-        let response = client
-            .post(&events_url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", device_token))
-            .json(&event_data)
-            .send()
-            .await
-            .map_err(|e| {
-                let error_msg = format!("Network error: {}", e);
-                // Spawn async logging task
-                let error_json = serde_json::json!({
-                    "error": e.to_string(),
-                    "session_id": session_id
-                });
-                tokio::spawn(async move {
-                    crate::utils::logging::log_remote_non_blocking(
-                        "clock_in_backend_error",
-                        "error",
-                        "Failed to send clock_in event to backend",
-                        Some(error_json)
-                    ).await;
-                });
-                error_msg
-            })?;
-
-        if !response.status().is_success() {
-            let status_code = response.status().as_u16();
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            let error_msg = format!("Clock in failed: {}", error_text);
-            crate::utils::logging::log_remote_non_blocking(
-                "clock_in_backend_failed",
-                "error",
-                "Clock in backend request failed",
-                Some(serde_json::json!({
-                    "error": error_text,
-                    "status": status_code,
-                    "session_id": session_id
-                }))
-            ).await;
-            return Err(error_msg);
-        }
-
-        log::info!("Clock in: Backend event sent successfully");
-        crate::utils::logging::log_remote_non_blocking(
-            "clock_in_backend_success",
-            "info",
-            "Clock in backend event sent successfully",
-            Some(serde_json::json!({
-                "session_id": session_id,
-                "status": response.status().as_u16()
-            }))
-        ).await;
-
-        // ✅ 3. Start background services now that user is clocked in
-        log::info!("Clock in: Starting background services");
-        crate::utils::logging::log_remote_non_blocking(
-            "clock_in_services_start",
-            "info",
-            "Starting background services for clocked in user",
-            Some(serde_json::json!({"session_id": session_id}))
-        ).await;
-        
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
+        // Spawn async task to handle backend communication
         tokio::spawn(async move {
-            crate::sampling::start_all_background_services(app_handle).await;
-        });
+            log::info!("Clock in: Sending clock_in event to backend (async)");
+            
+            let client = reqwest::Client::new();
+            let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
+            
+            let event_data = serde_json::json!({
+                "events": [{
+                    "type": "clock_in",
+                    "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                    "data": {
+                        "session_id": session_id,
+                        "source": "desktop_agent"
+                    }
+                }]
+            });
 
+            // Try to send to backend with timeout
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client
+                    .post(&events_url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", device_token))
+                    .header("X-Device-ID", device_id)
+                    .json(&event_data)
+                    .send()
+            ).await {
+                Ok(Ok(response)) => {
+                    if response.status().is_success() {
+                        log::info!("Clock in: Backend event sent successfully");
+                    } else {
+                        log::warn!("Clock in: Backend returned error ({}), queuing event for later", response.status());
+                        // Queue the clock_in event for later retry
+                        if let Err(queue_err) = crate::storage::offline_queue::queue_event("clock_in", &serde_json::json!({
+                            "session_id": session_id,
+                            "source": "desktop_agent"
+                        })).await {
+                            log::error!("Failed to queue clock_in event: {}", queue_err);
+                        } else {
+                            log::info!("Clock in: Event queued for later delivery");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    // Network error, queue the event for later
+                    log::warn!("Clock in: Network error, queuing event for later: {}", e);
+                    
+                    if let Err(queue_err) = crate::storage::offline_queue::queue_event("clock_in", &serde_json::json!({
+                        "session_id": session_id,
+                        "source": "desktop_agent"
+                    })).await {
+                        log::error!("Failed to queue clock_in event: {}", queue_err);
+                    } else {
+                        log::info!("Clock in: Event queued for later delivery");
+                    }
+                }
+                Err(_) => {
+                    // Timeout occurred, queue the event for later
+                    log::warn!("Clock in: Backend request timeout, queuing event for later");
+                    
+                    if let Err(queue_err) = crate::storage::offline_queue::queue_event("clock_in", &serde_json::json!({
+                        "session_id": session_id,
+                        "source": "desktop_agent"
+                    })).await {
+                        log::error!("Failed to queue clock_in event: {}", queue_err);
+                    } else {
+                        log::info!("Clock in: Event queued for later delivery");
+                    }
+                }
+            }
+        });
     } else {
         return Err("Not authenticated. Please login first.".to_string());
     }
-
+    
     Ok(())
 }
 
@@ -1173,184 +1217,261 @@ pub async fn clock_out(state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), Str
         None
     ).await;
     
-    log::info!("Clock out: Ending local session");
-    
-    // End local app usage session
-    if let Err(e) = crate::storage::app_usage::end_current_session().await {
-        log::warn!("Failed to end current app session: {}", e);
-        crate::utils::logging::log_remote_non_blocking(
-            "clock_out_end_session_error",
-            "warn",
-            "Failed to end current app session",
-            Some(serde_json::json!({"error": e.to_string()}))
-        ).await;
-    } else {
-        crate::utils::logging::log_remote_non_blocking(
-            "clock_out_end_session_success",
-            "info",
-            "Successfully ended current app session",
-            None
-        ).await;
-    }
-    
-    // Send a final app focus event to ensure any open app usage entries are closed on the backend
-    // This prevents the issue where the last app usage entry remains open with endTime: null
-    if let Ok(Some(current_app)) = crate::commands::get_current_app().await {
-        log::info!("Clock out: Sending final app focus event to close open entries");
-        
-        let event_data = serde_json::json!({
-            "app_name": current_app.name,
-            "app_id": current_app.app_id,
-            "window_title": current_app.window_title,
-            "timestamp": chrono::Utc::now().to_rfc3339()
-        });
-
-        match crate::sampling::send_event_to_backend("app_focus", &event_data).await {
-            Ok(_) => {
-                log::info!("✓ Final app focus event sent to close open entries");
-            }
-            Err(e) => {
-                log::warn!("Failed to send final app focus event: {}", e);
-            }
-        }
-    }
-    
-    // ✅ 1. Process any remaining queued events before stopping services
-    log::info!("Clock out: Processing remaining queued events");
-    
-    // Process pending events
-    if let Ok(events) = crate::storage::offline_queue::get_pending_events().await {
-        for event in events {
-            match crate::sampling::send_event_to_backend(&event.event_type, &event.event_data).await {
-                Ok(_) => {
-                    let _ = crate::storage::offline_queue::mark_event_processed(event.id).await;
-                    log::info!("Clock out: Processed queued event {}", event.id);
-                }
-                Err(e) => {
-                    log::warn!("Clock out: Failed to send queued event {}: {}", event.id, e);
-                    let _ = crate::storage::offline_queue::mark_event_failed(event.id).await;
-                }
-            }
-        }
-    }
-    
-    // Process pending heartbeats
-    if let Ok(heartbeats) = crate::storage::offline_queue::get_pending_heartbeats().await {
-        for heartbeat in heartbeats {
-            match crate::sampling::send_heartbeat_to_backend(&heartbeat.heartbeat_data).await {
-                Ok(_) => {
-                    let _ = crate::storage::offline_queue::mark_heartbeat_processed(heartbeat.id).await;
-                    log::info!("Clock out: Processed queued heartbeat {}", heartbeat.id);
-                }
-                Err(e) => {
-                    log::warn!("Clock out: Failed to send queued heartbeat {}: {}", heartbeat.id, e);
-                    let _ = crate::storage::offline_queue::mark_heartbeat_failed(heartbeat.id).await;
-                }
-            }
-        }
-    }
-    
-    // ✅ 2. Stop background services after processing all queued events
+    // ✅ 1. Stop background services immediately (don't wait for processing)
     crate::sampling::stop_services().await;
     log::info!("Clock out: Background services stopped");
 
-    // Reset idle state to prevent stale idle events
-    crate::sampling::reset_idle_state();
-    
-    // ✅ 3. End LOCAL session
-    crate::storage::work_session::end_session().await
-        .map_err(|e| format!("Failed to end local session: {}", e))?;
-    
-    
-    let (server_url, device_token) = {
+    // ✅ 2. End LOCAL session immediately
+    if let Err(e) = crate::storage::work_session::end_session().await {
+        log::warn!("Clock out: Failed to end local session: {}", e);
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_out_end_local_session_error",
+            "warn",
+            "Failed to end local session",
+            Some(serde_json::json!({"error": e.to_string()}))
+        ).await;
+        // Don't fail the clock out - the session will be cleaned up later
+    } else {
+        log::info!("Clock out: Local session ended successfully");
+        crate::utils::logging::log_remote_non_blocking(
+            "clock_out_end_local_session_success",
+            "info",
+            "Local session ended successfully",
+            None
+        ).await;
+    }
+
+    // ✅ 3. Move heavy processing to background (non-blocking)
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
-        // ✅ 2. Send clock_out event to REMOTE backend
-        let client = reqwest::Client::new();
-        let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
-        
-        let event_data = serde_json::json!({
-            "events": [{
-                "type": "clock_out",
-                "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                "data": {
-                    "source": "desktop_agent"
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
+        // Spawn background task for heavy processing
+        tokio::spawn(async move {
+            log::info!("Clock out: Starting background processing");
+            
+            // End local app usage session
+            if let Err(e) = crate::storage::app_usage::end_current_session().await {
+                log::warn!("Failed to end current app session: {}", e);
+            }
+            
+            // Send final app focus event
+            if let Ok(Some(current_app)) = crate::commands::get_current_app().await {
+                let event_data = serde_json::json!({
+                    "app_name": current_app.name,
+                    "app_id": current_app.app_id,
+                    "window_title": current_app.window_title,
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                });
+
+                if let Err(e) = crate::sampling::send_event_to_backend("app_focus", &event_data).await {
+                    log::warn!("Failed to send final app focus event: {}", e);
                 }
-            }]
+            }
+            
+            // Process pending events and heartbeats in background
+            log::info!("Clock out: Processing remaining queued events in background");
+            
+            // Process pending events with timeout
+            if let Ok(events) = crate::storage::offline_queue::get_pending_events().await {
+                for event in events {
+                    let timeout_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::sampling::send_event_to_backend(&event.event_type, &event.event_data)
+                    ).await;
+                    
+                    match timeout_result {
+                        Ok(Ok(_)) => {
+                            let _ = crate::storage::offline_queue::mark_event_processed(event.id).await;
+                            log::info!("Clock out: Processed queued event {}", event.id);
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!("Clock out: Failed to send queued event {}: {}", event.id, e);
+                            let _ = crate::storage::offline_queue::mark_event_failed(event.id).await;
+                        }
+                        Err(_) => {
+                            log::warn!("Clock out: Timeout sending queued event {}", event.id);
+                            let _ = crate::storage::offline_queue::mark_event_failed(event.id).await;
+                        }
+                    }
+                }
+            }
+            
+            // Process pending heartbeats with timeout
+            if let Ok(heartbeats) = crate::storage::offline_queue::get_pending_heartbeats().await {
+                for heartbeat in heartbeats {
+                    let timeout_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::sampling::send_heartbeat_to_backend(&heartbeat.heartbeat_data)
+                    ).await;
+                    
+                    match timeout_result {
+                        Ok(Ok(_)) => {
+                            let _ = crate::storage::offline_queue::mark_heartbeat_processed(heartbeat.id).await;
+                            log::info!("Clock out: Processed queued heartbeat {}", heartbeat.id);
+                        }
+                        Ok(Err(e)) => {
+                            log::warn!("Clock out: Failed to send queued heartbeat {}: {}", heartbeat.id, e);
+                            let _ = crate::storage::offline_queue::mark_heartbeat_failed(heartbeat.id).await;
+                        }
+                        Err(_) => {
+                            log::warn!("Clock out: Timeout sending queued heartbeat {}", heartbeat.id);
+                            let _ = crate::storage::offline_queue::mark_heartbeat_failed(heartbeat.id).await;
+                        }
+                    }
+                }
+            }
+            
+            // Send clock_out event to backend
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build();
+                
+            if let Ok(client) = client {
+                let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
+                
+                let event_data = serde_json::json!({
+                    "events": [{
+                        "type": "clock_out",
+                        "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                        "data": {
+                            "source": "desktop_agent"
+                        }
+                    }]
+                });
+
+                match client
+                    .post(&events_url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", device_token))
+                    .header("X-Device-ID", device_id)
+                    .json(&event_data)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            log::info!("Clock out: Backend event sent successfully");
+                        } else {
+                            log::warn!("Clock out: Backend returned error ({}), queuing event for later", response.status());
+                            let _ = crate::storage::offline_queue::queue_event("clock_out", &serde_json::json!({
+                                "source": "desktop_agent"
+                            })).await;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Clock out: Network error, queuing event for later: {}", e);
+                        let _ = crate::storage::offline_queue::queue_event("clock_out", &serde_json::json!({
+                            "source": "desktop_agent"
+                        })).await;
+                    }
+                }
+            }
+            
+            log::info!("Clock out: Background processing completed");
         });
-
-        let response = client
-            .post(&events_url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", device_token))
-            .json(&event_data)
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(format!("Clock out failed: {}", error_text));
-        }
-        
-
     } else {
         return Err("Not authenticated. Please login first.".to_string());
     }
 
+    // Reset idle state to prevent stale idle events
+    crate::sampling::reset_idle_state();
+    
     Ok(())
 }
 
 #[tauri::command]
 pub async fn get_work_session(state: State<'_, Arc<Mutex<AppState>>>) -> Result<WorkSessionInfo, String> {
-    let (server_url, device_token, employee_id) = {
+    // Check cache first
+    {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.employee_id.clone())
+        if app_state.work_session_cache.is_valid() {
+            if let Some(cached_data) = app_state.work_session_cache.data.clone() {
+                log::debug!("Returning cached work session data");
+                return Ok(cached_data);
+            }
+        }
+    }
+    
+    let (server_url, device_token, device_id, employee_id) = {
+        let app_state = state.lock().await;
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone(), app_state.employee_id.clone())
     };
 
-    if let (Some(server_url), Some(_device_token), Some(_employee_id)) = (server_url, device_token, employee_id) {
+    if let (Some(server_url), Some(_device_token), Some(device_id), Some(_employee_id)) = (server_url, device_token, device_id, employee_id) {
         // Fetch current work session from backend
         let client = reqwest::Client::new();
-        let sessions_url = format!("{}/api/devices/sessions", server_url.trim_end_matches('/'));
-        
-        // Get today's date range in Z format (easier to parse)
-        let today = chrono::Utc::now().date_naive();
-        let start_date = today.and_hms_opt(0, 0, 0).unwrap().and_utc().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        let end_date = today.and_hms_opt(23, 59, 59).unwrap().and_utc().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        
-        let url_with_params = format!("{}?startDate={}&endDate={}", sessions_url, start_date, end_date);
+        let current_session_url = format!("{}/api/devices/current-session", server_url.trim_end_matches('/'));
        
-        match client.get(&url_with_params).header("Authorization", format!("Bearer {}", _device_token)).send().await {
+        match client
+            .get(&current_session_url)
+            .header("Authorization", format!("Bearer {}", _device_token))
+            .header("X-Device-ID", device_id)
+            .send()
+            .await {
             Ok(response) if response.status().is_success() => {
-                if let Ok(sessions_data) = response.json::<serde_json::Value>().await {
-                    if let Some(sessions) = sessions_data.get("sessions").and_then(|s| s.as_array()) {
-                        // Find active session (no clock_out)
-                        for session in sessions {
-                            let clock_out = session.get("clockOut");
-                            let is_active = clock_out.is_none() || clock_out.and_then(|v| v.as_str()).is_none() || clock_out == Some(&serde_json::Value::Null);
-                            if is_active {
-                                // Active session found
-                                let started_at = session.get("clockIn")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                                
-                                // Get current app for active session
-                                let current_app = match get_current_app().await {
-                                    Ok(Some(app)) => Some(app.name),
-                                    _ => None
-                                };
-                                return Ok(WorkSessionInfo {
-                                    is_active: true,
-                                    started_at,
-                                    current_app,
-                                    idle_time_seconds: 0,
-                                    is_paused: false,
-                                });
+                if let Ok(session_data) = response.json::<serde_json::Value>().await {
+                    let is_active = session_data.get("is_active")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    
+                    if is_active {
+                        // Active session found
+                        let started_at = session_data.get("session")
+                            .and_then(|s| s.get("clockIn"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        
+                        let current_app = session_data.get("session")
+                            .and_then(|s| s.get("currentApp"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        
+                        // If no current app from backend, get it locally
+                        let current_app = if current_app.is_some() {
+                            current_app
+                        } else {
+                            match get_current_app().await {
+                                Ok(Some(app)) => Some(app.name),
+                                _ => None
                             }
+                        };
+                        
+                        let session_info = WorkSessionInfo {
+                            is_active: true,
+                            started_at,
+                            current_app,
+                            idle_time_seconds: 0,
+                            is_paused: false,
+                        };
+                        
+                        // Cache the result
+                        {
+                            let mut app_state = state.lock().await;
+                            app_state.work_session_cache.update(session_info.clone());
                         }
+                        
+                        return Ok(session_info);
+                    } else {
+                        // No active session
+                        let session_info = WorkSessionInfo {
+                            is_active: false,
+                            started_at: None,
+                            current_app: Some("TrackEx Agent".to_string()),
+                            idle_time_seconds: 0,
+                            is_paused: false,
+                        };
+                        
+                        // Cache the result
+                        {
+                            let mut app_state = state.lock().await;
+                            app_state.work_session_cache.update(session_info.clone());
+                        }
+                        
+                        return Ok(session_info);
                     }
                 }
             }
@@ -1367,31 +1488,43 @@ pub async fn get_work_session(state: State<'_, Arc<Mutex<AppState>>>) -> Result<
                         _ => None
                     };
                     
-                    return Ok(WorkSessionInfo {
+                    let session_info = WorkSessionInfo {
                         is_active: true,
                         started_at: Some(local_session.started_at.to_rfc3339()),
                         current_app,
                         idle_time_seconds: 0,
                         is_paused: false,
-                    });
+                    };
+                    
+                    // Cache the result
+                    {
+                        let mut app_state = state.lock().await;
+                        app_state.work_session_cache.update(session_info.clone());
+                    }
+                    
+                    return Ok(session_info);
                 }
             }
         }
     }
     
     // No active session or failed to fetch
-    Ok(WorkSessionInfo {
+    let session_info = WorkSessionInfo {
         is_active: false,
         started_at: None,
         current_app: Some("TrackEx Agent".to_string()),
         idle_time_seconds: 0,
         is_paused: false,
-    })
+    };
+    
+    // Cache the result
+    {
+        let mut app_state = state.lock().await;
+        app_state.work_session_cache.update(session_info.clone());
+    }
+    
+    Ok(session_info)
 }
-
-
-
-
 
 #[tauri::command]
 pub async fn get_tracking_status(
@@ -1781,12 +1914,12 @@ pub async fn get_app_info() -> Result<serde_json::Value, String> {
 pub async fn send_app_focus_event(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, String> {
-    let (server_url, device_token) = {
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
         // Get current app
         if let Ok(Some(app_info)) = get_current_app().await {
             // Send app_focus event to backend
@@ -1810,6 +1943,7 @@ pub async fn send_app_focus_event(
                 .post(&events_url)
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {}", device_token))
+                .header("X-Device-ID", device_id)
                 .json(&event_data)
                 .send()
                 .await;
@@ -1839,12 +1973,12 @@ pub async fn send_app_focus_event(
 pub async fn send_heartbeat(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, String> {
-    let (server_url, device_token) = {
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
         // Get current app for heartbeat
         let current_app = match get_current_app().await {
             Ok(Some(app)) => Some(serde_json::json!({
@@ -1907,6 +2041,7 @@ pub async fn send_heartbeat(
             .post(&heartbeat_url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", device_token))
+            .header("X-Device-ID", device_id)
             .json(&heartbeat_data)
             .send()
             .await;
@@ -1933,18 +2068,19 @@ pub async fn send_heartbeat(
 pub async fn check_pending_jobs(
     state: State<'_, Arc<Mutex<AppState>>>,
 ) -> Result<String, String> {
-    let (server_url, device_token) = {
+    let (server_url, device_token, device_id) = {
         let app_state = state.lock().await;
-        (app_state.server_url.clone(), app_state.device_token.clone())
+        (app_state.server_url.clone(), app_state.device_token.clone(), app_state.device_id.clone())
     };
 
-    if let (Some(server_url), Some(device_token)) = (server_url, device_token) {
+    if let (Some(server_url), Some(device_token), Some(device_id)) = (server_url, device_token, device_id) {
         let client = reqwest::Client::new();
         let jobs_url = format!("{}/api/ingest/jobs", server_url.trim_end_matches('/'));
         
         match client
             .get(&jobs_url)
             .header("Authorization", format!("Bearer {}", device_token))
+            .header("X-Device-ID", device_id)
             .send()
             .await
         {
@@ -1974,10 +2110,12 @@ pub async fn check_pending_jobs(
                                                 });
 
                                                 let events_url = format!("{}/api/ingest/events", server_url.trim_end_matches('/'));
+                                                let device_id = crate::storage::get_device_id().await.map_err(|_| anyhow::anyhow!("No device ID available"));
                                                 let _ = client
                                                     .post(&events_url)
                                                     .header("Content-Type", "application/json")
                                                     .header("Authorization", format!("Bearer {}", device_token))
+                                                    .header("X-Device-ID", device_id.expect("REASON").clone())
                                                     .json(&event_data)
                                                     .send()
                                                     .await;
@@ -2118,8 +2256,60 @@ pub async fn get_app_usage_summary() -> Result<std::collections::HashMap<String,
 }
 
 #[tauri::command]
-pub async fn get_usage_totals() -> Result<(i64, i64, i64, i64), String> {
+pub async fn get_usage_totals() -> Result<i64, String> {
     Ok(app_usage::get_usage_totals().await)
+}
+
+#[tauri::command]
+pub async fn refresh_work_session(state: State<'_, Arc<Mutex<AppState>>>) -> Result<WorkSessionInfo, String> {
+    // Force invalidate cache and fetch fresh data
+    {
+        let mut app_state = state.lock().await;
+        app_state.work_session_cache.invalidate();
+    }
+    
+    // Call get_work_session to fetch fresh data
+    get_work_session(state).await
+}
+
+#[tauri::command]
+pub async fn test_server_connection() -> Result<String, String> {
+    match crate::storage::get_server_url().await {
+        Ok(server_url) => {
+            if server_url.is_empty() {
+                return Err("No server URL configured".to_string());
+            }
+            
+            // Test basic connectivity
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .build()
+                .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            
+            let test_url = format!("{}/api/health", server_url.trim_end_matches('/'));
+            
+            match client.get(&test_url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        Ok(format!("✅ Server is reachable at {}", server_url))
+                    } else {
+                        Err(format!("❌ Server responded with status: {}", response.status()))
+                    }
+                },
+                Err(e) => {
+                    if e.is_connect() {
+                        Err(format!("❌ Cannot connect to server at {}. Please ensure the backend is running on the correct port.", server_url))
+                    } else if e.is_timeout() {
+                        Err(format!("❌ Connection timeout to {}. Server may be slow or unresponsive.", server_url))
+                    } else {
+                        Err(format!("❌ Network error: {}", e))
+                    }
+                }
+            }
+        },
+        Err(e) => Err(format!("Failed to get server URL: {}", e))
+    }
 }
 
 #[tauri::command]
@@ -2147,17 +2337,3 @@ pub async fn generate_monthly_summary(employee_id: String, device_id: String) ->
     crate::api::reporting::generate_monthly_summary(employee_id, device_id).await.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn sync_app_rules() -> Result<(), String> {
-    crate::api::app_rules::sync_app_rules().await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_app_rules() -> Result<Vec<crate::utils::productivity::AppRule>, String> {
-    Ok(crate::api::app_rules::get_app_rules().await)
-}
-
-#[tauri::command]
-pub async fn get_rule_statistics() -> Result<crate::api::app_rules::RuleStatistics, String> {
-    crate::api::app_rules::get_rule_statistics().await.map_err(|e| e.to_string())
-}

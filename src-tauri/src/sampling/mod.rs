@@ -347,7 +347,7 @@ pub fn get_job_polling_interval() -> u64 {
 #[allow(dead_code)]
 pub async fn start_queue_processing_service() {
     
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
     
     loop {
         if !SERVICES_RUNNING.load(Ordering::Relaxed) {
@@ -470,27 +470,65 @@ pub async fn start_sync_service() {
 
 }
 
+// Check if server is reachable with a simple connectivity test
+async fn is_server_reachable(server_url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build();
+    
+    if let Ok(client) = client {
+        let test_url = format!("{}/api/health", server_url.trim_end_matches('/'));
+        log::debug!("Testing server connectivity to: {}", test_url);
+        
+        match client.get(&test_url).send().await {
+            Ok(response) => {
+                log::debug!("Server connectivity test: {}", response.status());
+                response.status().is_success()
+            },
+            Err(e) => {
+                log::debug!("Server connectivity test failed: {}", e);
+                false
+            }
+        }
+    } else {
+        false
+    }
+}
+
 // Check if we're online by testing a simple API call
 async fn is_online() -> bool {
     if let Ok(server_url) = crate::storage::get_server_url().await {
         if let Ok(device_token) = crate::storage::get_device_token().await {
             if !server_url.is_empty() && !device_token.is_empty() {
+                let device_id = crate::storage::get_device_id().await
+                    .map_err(|_| anyhow::anyhow!("No device ID available"));
                 let client = reqwest::Client::new();
                 let test_url = format!("{}/api/auth/simple-session", server_url.trim_end_matches('/'));
+                
+                log::info!("🔍 Testing connectivity to: {}", test_url);
                 
                 match client
                     .get(&test_url)
                     .header("Authorization", format!("Bearer {}", device_token))
-                    .timeout(std::time::Duration::from_secs(5))
+                    .header("X-Device-ID", device_id.expect("REASON").clone())
+                    .timeout(std::time::Duration::from_secs(10))
                     .send()
                     .await
                 {
-                    Ok(response) => return response.status().is_success(),
-                    Err(_) => return false,
+                    Ok(response) => {
+                        log::info!("✅ Connectivity test successful: {}", response.status());
+                        return response.status().is_success();
+                    },
+                    Err(e) => {
+                        log::warn!("❌ Connectivity test failed: {}", e);
+                        return false;
+                    },
                 }
             }
         }
     }
+    log::warn!("❌ Cannot test connectivity: missing server URL or device token");
     false
 }
 
@@ -501,35 +539,46 @@ pub async fn send_heartbeat_to_backend(heartbeat_data: &serde_json::Value) -> an
     // Get server URL and device token from storage
     let server_url = crate::storage::get_server_url().await?;
     let device_token = crate::storage::get_device_token().await?;
+    let device_id = crate::storage::get_device_id().await?;
+
+    
     
     if server_url.is_empty() || device_token.is_empty() {
         log::warn!("Cannot send heartbeat: server_url or device_token is empty");
         return Err(anyhow::anyhow!("Server URL or device token is empty"));
     }
     
-    // Create HTTP client with proper timeout and retry configuration
+    // Create HTTP client with reasonable timeouts
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(10)) 
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
     
     let heartbeat_url = format!("{}/api/ingest/heartbeat", server_url.trim_end_matches('/'));
     
-    log::trace!("Sending heartbeat to {}: {}", heartbeat_url, serde_json::to_string_pretty(heartbeat_data).unwrap_or_default());
+    log::info!("🔗 Attempting to send heartbeat to: {}", heartbeat_url);
+    log::debug!("Heartbeat data: {}", serde_json::to_string_pretty(heartbeat_data).unwrap_or_default());
+    
+    // First, test if the server is reachable with a simple connectivity check
+    if !is_server_reachable(&server_url).await {
+        return Err(anyhow::anyhow!("Server is not reachable at {}. Please ensure the backend is running on the correct port.", server_url));
+    }
     
     let response = client
         .post(&heartbeat_url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", device_token))
+        .header("X-Device-ID", device_id)
         .json(heartbeat_data)
         .send()
         .await
         .map_err(|e| {
+            log::error!("❌ Heartbeat request failed: {}", e);
             if e.is_connect() {
-                anyhow::anyhow!("Network error: Cannot connect to server. Please check your network connection.")
+                anyhow::anyhow!("Network error: Cannot connect to server at {}. Please check your network connection and ensure the backend is running.", heartbeat_url)
             } else if e.is_timeout() {
-                anyhow::anyhow!("Network error: Request timeout. Please check your network connection.")
+                anyhow::anyhow!("Network error: Request timeout after 10 seconds. Server may be slow or unresponsive.")
             } else {
                 anyhow::anyhow!("Network error: {}", e)
             }
@@ -550,13 +599,14 @@ pub async fn send_event_to_backend(event_type: &str, event_data: &serde_json::Va
     // Get server URL and device token from storage
     let server_url = crate::storage::get_server_url().await?;
     let device_token = crate::storage::get_device_token().await?;
+    let device_id = crate::storage::get_device_id().await?;
     
     if server_url.is_empty() || device_token.is_empty() {
         log::warn!("Cannot send event: missing server URL or device token");
         return Ok(());
     }
     
-    // Create HTTP client with proper timeout and retry configuration
+    // Create HTTP client with reasonable timeouts
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -574,20 +624,23 @@ pub async fn send_event_to_backend(event_type: &str, event_data: &serde_json::Va
         }]
     });
     
-    log::debug!("Sending {} event to: {}", event_type, events_url);
+    log::info!("🔗 Attempting to send {} event to: {}", event_type, events_url);
+    log::debug!("Event payload: {}", serde_json::to_string_pretty(&event_payload).unwrap_or_default());
     
     let response = client
         .post(&events_url)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", device_token))
+        .header("X-Device-ID", device_id.clone())
         .json(&event_payload)
         .send()
         .await
         .map_err(|e| {
+            log::error!("❌ Event request failed: {}", e);
             if e.is_connect() {
-                anyhow::anyhow!("Network error: Cannot connect to server. Please check your network connection.")
+                anyhow::anyhow!("Network error: Cannot connect to server at {}. Please check your network connection and ensure the backend is running.", events_url)
             } else if e.is_timeout() {
-                anyhow::anyhow!("Network error: Request timeout. Please check your network connection.")
+                anyhow::anyhow!("Network error: Request timeout after 30 seconds. Server may be slow or unresponsive.")
             } else {
                 anyhow::anyhow!("Network error: {}", e)
             }

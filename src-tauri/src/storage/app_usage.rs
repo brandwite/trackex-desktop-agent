@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::database;
-use crate::utils::productivity::ProductivityCategory;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppUsageSession {
@@ -13,7 +12,6 @@ pub struct AppUsageSession {
     pub app_name: String,
     pub app_id: String,
     pub window_title: Option<String>,
-    pub category: ProductivityCategory,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub duration_seconds: i64,
@@ -25,9 +23,6 @@ pub struct AppUsageSession {
 pub struct AppUsageTracker {
     current_session: Option<AppUsageSession>,
     session_history: Vec<AppUsageSession>,
-    total_productive_time: i64,
-    total_neutral_time: i64,
-    total_unproductive_time: i64,
     total_idle_time: i64,
 }
 
@@ -36,9 +31,6 @@ impl AppUsageTracker {
         Self {
             current_session: None,
             session_history: Vec::new(),
-            total_productive_time: 0,
-            total_neutral_time: 0,
-            total_unproductive_time: 0,
             total_idle_time: 0,
         }
     }
@@ -48,7 +40,6 @@ impl AppUsageTracker {
         app_name: String,
         app_id: String,
         window_title: Option<String>,
-        category: ProductivityCategory,
         is_idle: bool,
     ) -> Result<()> {
         let now = Utc::now();
@@ -59,8 +50,6 @@ impl AppUsageTracker {
             current.duration_seconds = (now - current.start_time).num_seconds();
             current.is_active = false;
             
-            // Update totals
-            self.update_totals(&current);
             
             // Save to database
             self.save_session_to_db(&current).await?;
@@ -74,7 +63,6 @@ impl AppUsageTracker {
             app_name,
             app_id,
             window_title,
-            category,
             start_time: now,
             end_time: None,
             duration_seconds: 0,
@@ -101,8 +89,6 @@ impl AppUsageTracker {
             current.duration_seconds = (now - current.start_time).num_seconds();
             current.is_active = false;
             
-            // Update totals
-            self.update_totals(&current);
             
             // Save to database
             self.save_session_to_db(&current).await?;
@@ -125,13 +111,8 @@ impl AppUsageTracker {
         &self.session_history
     }
 
-    pub fn get_totals(&self) -> (i64, i64, i64, i64) {
-        (
-            self.total_productive_time,
-            self.total_neutral_time,
-            self.total_unproductive_time,
-            self.total_idle_time,
-        )
+    pub fn get_totals(&self) -> i64 {
+        self.total_idle_time
     }
 
     pub fn get_app_usage_summary(&self) -> HashMap<String, AppUsageSummary> {
@@ -143,7 +124,7 @@ impl AppUsageTracker {
             let entry = summary.entry(session.app_name.clone()).or_insert_with(|| {
                 AppUsageSummary::new(session.app_name.clone(), session.app_id.clone())
             });
-            entry.add_time(session.category.clone(), current_duration, session.is_idle);
+            entry.add_time(current_duration, session.is_idle);
         }
 
         // Process history
@@ -151,39 +132,25 @@ impl AppUsageTracker {
             let entry = summary.entry(session.app_name.clone()).or_insert_with(|| {
                 AppUsageSummary::new(session.app_name.clone(), session.app_id.clone())
             });
-            entry.add_time(session.category.clone(), session.duration_seconds, session.is_idle);
+            entry.add_time(session.duration_seconds, session.is_idle);
         }
 
         summary
     }
 
-    fn update_totals(&mut self, session: &AppUsageSession) {
-        let duration = session.duration_seconds;
-        
-        if session.is_idle {
-            self.total_idle_time += duration;
-        } else {
-            match session.category {
-                ProductivityCategory::PRODUCTIVE => self.total_productive_time += duration,
-                ProductivityCategory::NEUTRAL => self.total_neutral_time += duration,
-                ProductivityCategory::UNPRODUCTIVE => self.total_unproductive_time += duration,
-            }
-        }
-    }
 
     async fn save_session_to_db(&self, session: &AppUsageSession) -> Result<()> {
         let conn = database::get_connection()?;
         
         conn.execute(
             "INSERT INTO app_usage_sessions (
-                app_name, app_id, window_title, category, 
+                app_name, app_id, window_title, 
                 start_time, end_time, duration_seconds, is_idle, is_active, synced
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session.app_name,
                 session.app_id,
                 session.window_title,
-                session.category.to_string(),
                 session.start_time,
                 session.end_time,
                 session.duration_seconds,
@@ -203,7 +170,7 @@ impl AppUsageTracker {
         let cutoff_time = Utc::now() - Duration::hours(hours);
         
         let mut stmt = conn.prepare(
-            "SELECT id, app_name, app_id, window_title, category, 
+            "SELECT id, app_name, app_id, window_title, 
                     start_time, end_time, duration_seconds, is_idle, is_active
              FROM app_usage_sessions 
              WHERE start_time >= ?1 
@@ -211,24 +178,16 @@ impl AppUsageTracker {
         )?;
         
         let rows = stmt.query_map(params![cutoff_time], |row| {
-            let category_str: String = row.get(4)?;
-            let category = match category_str.as_str() {
-                "PRODUCTIVE" => ProductivityCategory::PRODUCTIVE,
-                "UNPRODUCTIVE" => ProductivityCategory::UNPRODUCTIVE,
-                _ => ProductivityCategory::NEUTRAL,
-            };
-            
             Ok(AppUsageSession {
                 id: Some(row.get(0)?),
                 app_name: row.get(1)?,
                 app_id: row.get(2)?,
                 window_title: row.get(3)?,
-                category,
-                start_time: row.get(5)?,
-                end_time: row.get(6)?,
-                duration_seconds: row.get(7)?,
-                is_idle: row.get(8)?,
-                is_active: row.get(9)?,
+                start_time: row.get(4)?,
+                end_time: row.get(5)?,
+                duration_seconds: row.get(6)?,
+                is_idle: row.get(7)?,
+                is_active: row.get(8)?,
             })
         })?;
         
@@ -250,9 +209,6 @@ pub struct AppUsageSummary {
     pub app_name: String,
     pub app_id: String,
     pub total_time: i64,
-    pub productive_time: i64,
-    pub neutral_time: i64,
-    pub unproductive_time: i64,
     pub idle_time: i64,
     pub session_count: i32,
 }
@@ -263,26 +219,17 @@ impl AppUsageSummary {
             app_name,
             app_id,
             total_time: 0,
-            productive_time: 0,
-            neutral_time: 0,
-            unproductive_time: 0,
             idle_time: 0,
             session_count: 0,
         }
     }
 
-    fn add_time(&mut self, category: ProductivityCategory, duration: i64, is_idle: bool) {
+    fn add_time(&mut self, duration: i64, is_idle: bool) {
         self.total_time += duration;
         self.session_count += 1;
         
         if is_idle {
             self.idle_time += duration;
-        } else {
-            match category {
-                ProductivityCategory::PRODUCTIVE => self.productive_time += duration,
-                ProductivityCategory::NEUTRAL => self.neutral_time += duration,
-                ProductivityCategory::UNPRODUCTIVE => self.unproductive_time += duration,
-            }
         }
     }
 }
@@ -302,11 +249,10 @@ pub async fn start_app_session(
     app_name: String,
     app_id: String,
     window_title: Option<String>,
-    category: ProductivityCategory,
     is_idle: bool,
 ) -> Result<()> {
     let mut tracker = APP_USAGE_TRACKER.lock().await;
-    tracker.start_app_session(app_name, app_id, window_title, category, is_idle).await
+    tracker.start_app_session(app_name, app_id, window_title, is_idle).await
 }
 
 pub async fn update_current_session(is_idle: bool) -> Result<()> {
@@ -330,7 +276,7 @@ pub async fn get_app_usage_summary() -> HashMap<String, AppUsageSummary> {
     tracker.get_app_usage_summary()
 }
 
-pub async fn get_usage_totals() -> (i64, i64, i64, i64) {
+pub async fn get_usage_totals() -> i64 {
     let tracker = APP_USAGE_TRACKER.lock().await;
     tracker.get_totals()
 }
@@ -350,8 +296,6 @@ pub async fn reset_tracker() -> Result<()> {
         current.duration_seconds = (now - current.start_time).num_seconds();
         current.is_active = false;
         
-        // Update totals
-        tracker.update_totals(&current);
         
         // Save to database
         tracker.save_session_to_db(&current).await?;
@@ -396,12 +340,12 @@ pub async fn init_database() -> Result<()> {
             app_name TEXT NOT NULL,
             app_id TEXT NOT NULL,
             window_title TEXT,
-            category TEXT NOT NULL,
             start_time DATETIME NOT NULL,
             end_time DATETIME,
             duration_seconds INTEGER NOT NULL DEFAULT 0,
             is_idle BOOLEAN NOT NULL DEFAULT 0,
             is_active BOOLEAN NOT NULL DEFAULT 1,
+            synced BOOLEAN NOT NULL DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )",
         [],
@@ -418,10 +362,6 @@ pub async fn init_database() -> Result<()> {
         [],
     )?;
     
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_app_usage_category ON app_usage_sessions(category)",
-        [],
-    )?;
     
     Ok(())
 }

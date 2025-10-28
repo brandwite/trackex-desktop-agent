@@ -13,7 +13,7 @@ interface LoginRequest {
 
 // Removed AuthStatus interface since not using session restoration
 
-function LoginScreen({ onLogin }: LoginScreenProps) {
+function LoginScreen({ onLogin }: Readonly<LoginScreenProps>) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   // Hardcoded server URL - users don't need to see or change this

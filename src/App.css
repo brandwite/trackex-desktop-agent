@@ -670,6 +670,28 @@ body {
   text-align: center;
 }
 
+.trackex-offline {
+  background: #fff3e0;
+  color: #e65100;
+  padding: 12px 24px;
+  margin: 0 24px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.offline-icon {
+  font-size: 16px;
+}
+
+.offline-text {
+  font-weight: 500;
+}
+
 /* Activity Status */
 .trackex-activity {
   padding: 0 24px 20px;

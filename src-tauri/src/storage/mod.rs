@@ -9,6 +9,43 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::sync::OnceLock;
+use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone)]
+pub struct WorkSessionCache {
+    pub data: Option<crate::commands::WorkSessionInfo>,
+    pub last_fetched: Option<DateTime<Utc>>,
+    pub cache_duration_seconds: i64,
+}
+
+impl WorkSessionCache {
+    pub fn new() -> Self {
+        Self {
+            data: None,
+            last_fetched: None,
+            cache_duration_seconds: 60, // Cache for 1 minute
+        }
+    }
+    
+    pub fn is_valid(&self) -> bool {
+        if let Some(last_fetched) = self.last_fetched {
+            let now = Utc::now();
+            (now - last_fetched).num_seconds() < self.cache_duration_seconds
+        } else {
+            false
+        }
+    }
+    
+    pub fn update(&mut self, data: crate::commands::WorkSessionInfo) {
+        self.data = Some(data);
+        self.last_fetched = Some(Utc::now());
+    }
+    
+    pub fn invalidate(&mut self) {
+        self.data = None;
+        self.last_fetched = None;
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -18,6 +55,7 @@ pub struct AppState {
     pub server_url: Option<String>,
     pub employee_id: Option<String>,
     pub is_paused: bool,
+    pub work_session_cache: WorkSessionCache,
 }
 
 impl AppState {
@@ -29,6 +67,7 @@ impl AppState {
             server_url: None,
             employee_id: None,
             is_paused: false,
+            work_session_cache: WorkSessionCache::new(),
         }
     }
 
@@ -43,8 +82,6 @@ impl AppState {
         // Load recent app usage sessions
         app_usage::load_recent_sessions(24).await?; // Load last 24 hours
         
-        // Initialize app rules
-        crate::api::app_rules::initialize_app_rules().await?;
         
         Ok(())
     }
@@ -116,6 +153,22 @@ pub async fn get_device_token() -> Result<String> {
                 }
             } else {
                 Err(anyhow::anyhow!("No device token found - user not authenticated"))
+            }
+        }
+        Err(_) => {
+            Err(anyhow::anyhow!("Global app state not available"))
+        }
+    }
+}
+
+pub async fn get_device_id() -> Result<String> {
+    match get_global_app_state() {
+        Ok(app_state) => {
+            let state = app_state.lock().await;
+            if let Some(id) = &state.device_id {
+                Ok(id.clone())
+            } else {
+                Err(anyhow::anyhow!("No device ID found in app state"))
             }
         }
         Err(_) => {

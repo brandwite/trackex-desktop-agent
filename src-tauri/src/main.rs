@@ -52,6 +52,12 @@ fn main() {
             get_current_app,
             send_diagnostics,
             get_permissions_status,
+            
+            // Logging configuration commands
+            update_logging_config,
+            get_logging_config,
+            sync_logging_config,
+            start_logging_sync_service,
             request_permissions,
             get_app_info,
             send_app_focus_event,
@@ -70,9 +76,8 @@ fn main() {
             generate_today_report,
             generate_weekly_report,
             generate_monthly_summary,
-            sync_app_rules,
-            get_app_rules,
-            get_rule_statistics
+            test_server_connection,
+            refresh_work_session
         ])
         .setup(|app| {
             // Set the global app state
@@ -92,10 +97,6 @@ fn main() {
                 } else {
                 }
                 
-                if let Err(e) = crate::api::app_rules::initialize_app_rules().await {
-                    log::error!("Failed to initialize app rules: {}", e);
-                } else {
-                }
                 
                 // Initialize power state monitoring
                 crate::sampling::power_state::init();
@@ -106,6 +107,9 @@ fn main() {
                 
                 // Start sync service for offline/online data synchronization
                 tokio::spawn(crate::sampling::start_sync_service());
+                
+                // Start logging configuration sync service
+                crate::utils::logging::start_logging_config_sync_service().await;
                 
                 // Start all sampling services - but only if user is authenticated AND clocked in
                 // This prevents race conditions where services try to access empty global state
